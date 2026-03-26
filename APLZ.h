@@ -22,7 +22,8 @@
 // ─── パイプライン定数 ──────────────────────────────────────────────────────────
 //  これらの値は compression.metal 内の constant 宣言と一致させること。
 
-static const uint32_t APLZ_MAGIC_V2  = 2u;
+static const uint32_t APLZ_MAGIC_V2  = 2u;    // 旧バージョン (グローバルテーブル)
+static const uint32_t APLZ_MAGIC_V3  = 3u;    // per-chunk tANS テーブル
 static const uint32_t APLZ_CHUNK_SIZE = 65536u;   // LZ77 チャンク単位 (64 KB)
 static const uint32_t APLZ_TG_SIZE   = 256u;      // Metal threadgroup size
 static const uint32_t APLZ_N_STREAMS = 256u;      // 並列 ANS ストリーム数 (= TG_SIZE)
