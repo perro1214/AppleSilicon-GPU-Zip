@@ -9,6 +9,7 @@ Metal Compute Shader (MSL 3.0) + tANS (Asymmetric Numeral Systems) を組み合�
 - **並列 LZ77**: 256 スレッドが 64 KB チャンクを協調処理。2-way ハッシュ (atomic_fetch_min) で高速マッチ探索
 - **256 Interleaved tANS**: 各スレッドが独立した ANS 状態を保持し、256 本のビットストリームを並列にエンコード/デコード
 - **並列 LZ77 デコード**: 非重複マッチは 256 スレッドで並列コピー、重複マッチ (dist < len) はシリアルフォールバック。Barrier 削減最適化付き
+- **非同期ダブルバッファリング**: GCD (`dispatch_semaphore` / `dispatch_group`) によるバッチパイプライン。GPU 実行と CPU I/O を完全にオーバーラップ
 - **Perfect Round-trip**: 圧縮→解凍でバイトレベルの完全一致を保証
 
 ## アーキテクチャ
@@ -39,11 +40,13 @@ mmap(input)
     | SymInfo[512] + enc_table[1024]
     v
 +--------------------------------------------------+
-|  GPU Pass 2: tans_encode                         |
+|  GPU Pass 2: tans_encode (double-buffered batch) |
 |  256 interleaved ANS streams                     |
 |  + sentinel bit + SIMD prefix sum                |
+|  dispatch_semaphore: slot exclusion               |
+|  addCompletedHandler -> serial write queue        |
 +--------------------------------------------------+
-    | 256 x bitstreams
+    | 256 x bitstreams (async write overlap)
     v
   .aplz file
 ```
@@ -51,7 +54,7 @@ mmap(input)
 ### 解凍パイプライン (`-d`)
 
 ```
-read .aplz
+read .aplz header + tANS tables
     |
     v
 +--------------------------------------------------+
@@ -61,19 +64,16 @@ read .aplz
     | dec_table[1024]
     v
 +--------------------------------------------------+
-|  GPU Pass 1: tans_decode                         |
-|  256 streams: reverse bitstream playback         |
-|  sentinel detection via clz()                    |
-|  -> interleaved token array                      |
-+--------------------------------------------------+
-    | LzToken[]
-    v
-+--------------------------------------------------+
-|  GPU Pass 2: lz77_decode                         |
-|  Hybrid serial/parallel expansion                |
-|  - Literals: Phase 1 (all threads)               |
-|  - Matches: Phase 2 (cooperative copy)           |
-|  Barrier reduction via max_match_written tracking|
+|  Double-buffered batch pipeline                  |
+|  CPU: read batch N+1  |  GPU: decode batch N     |
+|  (dispatch_semaphore slot exclusion)             |
+|                                                  |
+|  Per batch:                                      |
+|    GPU Pass 1: tans_decode                       |
+|    256 streams: reverse bitstream playback       |
+|    GPU Pass 2: lz77_decode                       |
+|    Hybrid serial/parallel expansion              |
+|    -> buf_out[chunk_offset] (direct write)       |
 +--------------------------------------------------+
     v
   restored original data
@@ -136,17 +136,20 @@ cmp test_text.bin decoded.bin  # Perfect Match
 
 | Data | Input | Output | Ratio | Throughput |
 |---|---|---|---|---|
-| Text (repeating pattern) | 1.14 MB | 36 KB | 3.0% | 46 MB/s |
-| Random binary | 10 MB | 10.9 MB | 104% | 78 MB/s |
+| Text (repeating pattern) | 1.14 MB | 36 KB | 3.0% | 36 MB/s |
+| Random binary | 10 MB | 10.9 MB | 104% | 84 MB/s |
+| **Text (large)** | **100 MB** | **2.9 MB** | **2.8%** | **157 MB/s** |
 
 ### 解凍
 
 | Data | Speed | Notes |
 |---|---|---|
-| Text (1.14 MB) | 27.9 MB/s | Parallel LZ77 decode (256 threads) |
-| Random (10 MB) | 329 MB/s | Mostly literals, minimal match processing |
+| Text (1.14 MB) | 280 MB/s | 1 batch, pipeline overhead minimal |
+| Random (10 MB) | 140 MB/s | 5 batches, mostly literals |
+| **Text (100 MB)** | **4.4 GB/s** | **50 batches, full pipeline overlap** |
 
 > Random data is incompressible so output slightly exceeds input (tANS/distance field overhead).
+> Large file performance demonstrates the benefit of the async double-buffered pipeline.
 
 ## ソースファイル構成
 
@@ -164,6 +167,7 @@ cmp test_text.bin decoded.bin  # Perfect Match
 - **ANS Encoding**: Forward encode with renormalization, sentinel bit for bitstream end detection
 - **ANS Decoding**: Reverse playback from final state, sentinel via `clz()`, O(1) decode table lookup
 - **LZ77 Parallel Decode**: Hybrid approach -- serial fallback for token count > 4096, parallel cooperative copy with barrier reduction for dense match streams
+- **Async Double Buffering**: GCD-based batch pipeline (32 chunks/batch, 2 slots). `dispatch_semaphore` for slot exclusion, `addCompletedHandler` + serial `dispatch_queue` for ordered async writes
 
 ## 既知の制約
 
