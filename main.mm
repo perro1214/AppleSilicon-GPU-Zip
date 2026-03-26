@@ -1,10 +1,14 @@
 // main.mm — APLZ Host Driver (圧縮 + 解凍)
 //
-// 非同期ダブルバッファリングパイプライン:
-//   圧縮: GPU Pass1 (全チャンク一括) → CPU tANS → Pass2 (バッチパイプライン)
-//         GPU Pass2 実行と完了バッチのファイル書き出しをオーバーラップ
-//   解凍: バッチ読み込み → GPU decode → 出力 (ダブルバッファ)
-//         CPU ファイル読み込みと GPU デコードをオーバーラップ
+// ストリーミング・メガバッチ・パイプライン:
+//   入力サイズに依存しない O(1) メモリ使用量で動作する。
+//   MEGA_BATCH_CHUNKS (512) チャンク = 32MB 単位で処理し、
+//   バッファを再利用する。
+//
+//   圧縮: Phase A: Pass1 メガバッチループ (ヒストグラム収集)
+//          Phase B: CPU tANS テーブル構築
+//          Phase C: Pass1 再実行 + Pass2 ダブルバッファ バッチパイプライン
+//   解凍: メガバッチループ (読み込み → GPU decode → fwrite)
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -34,8 +38,9 @@ static const uint32_t N_SYMBOLS   = APLZ_N_SYMBOLS;
 static const uint32_t BS_CAP      = APLZ_BS_CAP;
 
 // ─── パイプライン定数 ────────────────────────────────────────────────────────
-static const uint32_t BATCH_CHUNKS = 32;   // バッチあたりのチャンク数
-static const uint32_t N_BUFS       = 2;    // ダブルバッファ
+static const uint32_t MEGA_BATCH_CHUNKS = 512;   // メガバッチ: 512 * 64KB = 32MB
+static const uint32_t BATCH_CHUNKS      = 32;    // Pass2 バッチあたりのチャンク数
+static const uint32_t N_BUFS            = 2;     // ダブルバッファ
 
 // ─── ヘルパー ──────────────────────────────────────────────────────────────────
 [[noreturn]] static void die(const char* msg) { perror(msg); exit(EXIT_FAILURE); }
@@ -162,15 +167,53 @@ static void build_decode_table(const SymInfo* si, const uint16_t* spread,
     }
 }
 
+// ─── GPU Pass1 をメガバッチ分 dispatch するヘルパー ────────────────────────────
+// buf_in の offset をずらし、mc_count チャンク分を処理する。
+// buf_sparse/buf_compact/buf_cnt は先頭から再利用される。
+static void dispatch_pass1(id<MTLCommandQueue> cq,
+                           id<MTLComputePipelineState> pso,
+                           id<MTLBuffer> buf_in,
+                           id<MTLBuffer> buf_sparse,
+                           id<MTLBuffer> buf_compact,
+                           id<MTLBuffer> buf_cnt,
+                           uint32_t mc_start,
+                           uint32_t mc_count,
+                           size_t   file_size) {
+    size_t in_offset = (size_t)mc_start * CHUNK_SIZE;
+    uint32_t mb_bytes = (uint32_t)std::min(
+        (uint64_t)mc_count * CHUNK_SIZE,
+        (uint64_t)file_size - (uint64_t)in_offset);
+
+    id<MTLCommandBuffer> cb = [cq commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:buf_in      offset:in_offset atIndex:0];
+    [enc setBuffer:buf_sparse  offset:0         atIndex:1];
+    [enc setBuffer:buf_compact offset:0         atIndex:2];
+    [enc setBuffer:buf_cnt     offset:0         atIndex:3];
+    [enc setBytes:&mb_bytes length:4 atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(mc_count, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    if (cb.error) {
+        fprintf(stderr, "[APLZ] Pass 1 error: %s\n",
+                cb.error.localizedDescription.UTF8String);
+        exit(EXIT_FAILURE);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 圧縮モード (-c)
 //
-// パイプライン:
-//   GPU Pass 1 (全チャンク一括) → CPU histogram + tANS テーブル構築
-//   → GPU Pass 2: ダブルバッファ バッチパイプライン
-//     バッチ N の GPU tANS エンコードと、バッチ N-1 の結果のファイル書き出しを
-//     オーバーラップさせる。dispatch_semaphore でスロットの排他制御。
-//     シリアル write キューでチャンク順序を保証。
+// ストリーミング・パイプライン:
+//   Phase A: GPU Pass1 をメガバッチ (32MB) 単位で実行し、ヒストグラムを累積。
+//            バッファは MEGA_BATCH_CHUNKS 分のみ確保。
+//   Phase B: CPU histogram + tANS テーブル構築
+//   Phase C: GPU Pass1 を再実行 → Pass2 ダブルバッファ バッチパイプライン。
+//            sparse バッファは解放済み。compact + cnt のみ使用。
 // ═══════════════════════════════════════════════════════════════════════════════
 static int compress(const char* in_path, const char* out_path, const char* shader_path) {
     // ── ゼロコピー I/O ──────────────────────────────────────────────────────
@@ -182,6 +225,8 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     if (file_size == 0) {
         fprintf(stderr, "[APLZ] Empty input.\n"); close(fd); return EXIT_FAILURE;
     }
+
+    // mmap: 仮想アドレス空間のみ確保。物理メモリは OS がページ単位で管理。
     void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (mapped == MAP_FAILED) die("mmap");
     madvise(mapped, file_size, MADV_SEQUENTIAL);
@@ -195,6 +240,7 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     printf("[APLZ] Device   : %s\n", dev.name.UTF8String);
     id<MTLCommandQueue> cq = [dev newCommandQueue];
 
+    // mmap 全体を NoCopy バッファとして保持 (仮想メモリ、物理はページフォールトで遅延確保)
     id<MTLBuffer> buf_in = [dev newBufferWithBytesNoCopy:mapped
                                                   length:file_size
                                                  options:MTLResourceStorageModeShared
@@ -204,71 +250,70 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     const uint32_t num_chunks = (uint32_t)((file_size + CHUNK_SIZE - 1) / CHUNK_SIZE);
     printf("[APLZ] Chunks   : %u\n", num_chunks);
 
-    const size_t sz_tok = (size_t)num_chunks * CHUNK_SIZE * sizeof(LzToken);
-    const size_t sz_cnt = (size_t)num_chunks * sizeof(uint32_t);
+    // ── メガバッチサイズのバッファ確保 (O(1) メモリ) ─────────────────────────
+    const uint32_t mb_chunks = std::min((uint32_t)MEGA_BATCH_CHUNKS, num_chunks);
+    const size_t sz_tok_mb = (size_t)mb_chunks * CHUNK_SIZE * sizeof(LzToken);
+    const size_t sz_cnt_mb = (size_t)mb_chunks * sizeof(uint32_t);
 
-    id<MTLBuffer> buf_sparse  = [dev newBufferWithLength:sz_tok options:MTLResourceStorageModeShared];
-    id<MTLBuffer> buf_compact = [dev newBufferWithLength:sz_tok options:MTLResourceStorageModeShared];
-    id<MTLBuffer> buf_cnt     = [dev newBufferWithLength:sz_cnt options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_sparse  = [dev newBufferWithLength:sz_tok_mb options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_compact = [dev newBufferWithLength:sz_tok_mb options:MTLResourceStorageModeShared];
+    id<MTLBuffer> buf_cnt     = [dev newBufferWithLength:sz_cnt_mb options:MTLResourceStorageModeShared];
+
+    if (!buf_sparse || !buf_compact || !buf_cnt) {
+        fprintf(stderr, "[APLZ] Buffer alloc failed.\n"); return EXIT_FAILURE;
+    }
 
     id<MTLLibrary> lib = compile_shader(dev, shader_path);
+    id<MTLFunction> fn1 = [lib newFunctionWithName:@"compress_chunk"];
+    NSError* err = nil;
+    id<MTLComputePipelineState> pso1 = [dev newComputePipelineStateWithFunction:fn1 error:&err];
+    if (!pso1) {
+        fprintf(stderr, "[APLZ] PSO1: %s\n", err.localizedDescription.UTF8String);
+        return EXIT_FAILURE;
+    }
 
     CFTimeInterval t_total_start = CACurrentMediaTime();
 
-    // ── GPU Pass 1: LZ77 (全チャンク一括) ────────────────────────────────────
-    {
-        id<MTLFunction> fn = [lib newFunctionWithName:@"compress_chunk"];
-        NSError* err = nil;
-        id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
-        if (!pso) {
-            fprintf(stderr, "[APLZ] PSO1: %s\n", err.localizedDescription.UTF8String);
-            return EXIT_FAILURE;
-        }
-
-        id<MTLCommandBuffer> cb = [cq commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:buf_in      offset:0 atIndex:0];
-        [enc setBuffer:buf_sparse  offset:0 atIndex:1];
-        [enc setBuffer:buf_compact offset:0 atIndex:2];
-        [enc setBuffer:buf_cnt     offset:0 atIndex:3];
-        uint32_t total = (uint32_t)file_size;
-        [enc setBytes:&total length:4 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(num_chunks, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
-        [enc endEncoding];
-
-        CFTimeInterval t0 = CACurrentMediaTime();
-        [cb commit]; [cb waitUntilCompleted];
-        CFTimeInterval t1 = CACurrentMediaTime();
-
-        if (cb.error) {
-            fprintf(stderr, "[APLZ] Pass 1 error: %s\n",
-                    cb.error.localizedDescription.UTF8String);
-            return EXIT_FAILURE;
-        }
-        printf("[APLZ] Pass 1   : %.2f ms  (LZ77 + overlap resolution)\n", (t1-t0)*1000.0);
-    }
-
-    // ── CPU: ヒストグラム + tANS テーブル ────────────────────────────────────
-    const LzToken*  compact_ptr = (const LzToken*)buf_compact.contents;
-    const uint32_t* cnt_ptr     = (const uint32_t*)buf_cnt.contents;
-
+    // ═══ Phase A: GPU Pass1 メガバッチループ (ヒストグラム収集) ══════════════
+    uint32_t n_mega = (num_chunks + mb_chunks - 1) / mb_chunks;
+    uint32_t raw_freq[N_SYMBOLS] = {};
     uint64_t total_tokens = 0, total_matches = 0;
-    for (uint32_t c = 0; c < num_chunks; c++) total_tokens += cnt_ptr[c];
-    for (uint32_t c = 0; c < num_chunks; c++) {
-        const LzToken* base = compact_ptr + (uint64_t)c * CHUNK_SIZE;
-        for (uint32_t i = 0; i < cnt_ptr[c]; i++)
-            if (base[i].is_match) total_matches++;
+
+    printf("[APLZ] MegaBatch: %u mega-batches x %u chunks (%.1f MB/batch)\n",
+           n_mega, mb_chunks, (double)mb_chunks * CHUNK_SIZE / (1024.0 * 1024.0));
+
+    CFTimeInterval t1_start = CACurrentMediaTime();
+
+    for (uint32_t mb = 0; mb < n_mega; mb++) {
+        uint32_t mc_start = mb * mb_chunks;
+        uint32_t mc_count = std::min(mb_chunks, num_chunks - mc_start);
+
+        dispatch_pass1(cq, pso1, buf_in, buf_sparse, buf_compact, buf_cnt,
+                        mc_start, mc_count, file_size);
+
+        // ヒストグラム累積
+        const LzToken*  compact_ptr = (const LzToken*)buf_compact.contents;
+        const uint32_t* cnt_ptr     = (const uint32_t*)buf_cnt.contents;
+
+        compute_histogram(compact_ptr, cnt_ptr, mc_count, raw_freq);
+
+        for (uint32_t c = 0; c < mc_count; c++) {
+            total_tokens += cnt_ptr[c];
+            const LzToken* base = compact_ptr + (uint64_t)c * CHUNK_SIZE;
+            for (uint32_t i = 0; i < cnt_ptr[c]; i++)
+                if (base[i].is_match) total_matches++;
+        }
     }
+
+    CFTimeInterval t1_end = CACurrentMediaTime();
+    printf("[APLZ] Pass 1a  : %.2f ms  (LZ77 + histogram, streaming)\n", (t1_end-t1_start)*1000.0);
+
     printf("[APLZ] Tokens   : %llu  (%llu matches, %.1f%%)\n",
            (unsigned long long)total_tokens,
            (unsigned long long)total_matches,
            100.0 * total_matches / std::max(total_tokens, (uint64_t)1));
 
-    uint32_t raw_freq[N_SYMBOLS] = {};
-    compute_histogram(compact_ptr, cnt_ptr, num_chunks, raw_freq);
-
+    // ═══ Phase B: CPU tANS テーブル構築 ════════════════════════════════════
     SymInfo sym_info[N_SYMBOLS];
     normalize_histogram(raw_freq, sym_info);
 
@@ -276,7 +321,10 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     build_spread_table(sym_info, spread);
     build_encode_table(sym_info, spread, enc_table_cpu);
 
-    // ── Pass 2: ダブルバッファ バッチパイプライン ─────────────────────────────
+    // sparse バッファ解放 (Phase C では不要… と思いきや Pass1 再実行に必要)
+    // → Phase C でも Pass1 を走らせるので sparse は保持する
+
+    // ═══ Phase C: Pass1 再実行 + Pass2 ダブルバッファ パイプライン ═══════════
     // 共有読み取り専用バッファ
     id<MTLBuffer> buf_sym = [dev newBufferWithLength:N_SYMBOLS * sizeof(SymInfo)
                                              options:MTLResourceStorageModeShared];
@@ -327,93 +375,100 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     fwrite(offsets.data(), 8, num_chunks, fout);
 
     // ── パイプライン同期プリミティブ ─────────────────────────────────────────
-    // buf_sem: スロット排他制御 (GPU が使用中のバッファへの CPU 上書きを防止)
-    // write_q: シリアルキューでファイル書き出し順序を保証
-    // done_grp: 全バッチ完了待ち
     dispatch_semaphore_t buf_sem = dispatch_semaphore_create(N_BUFS);
     dispatch_queue_t write_q = dispatch_queue_create("aplz.write", DISPATCH_QUEUE_SERIAL);
     dispatch_group_t done_grp = dispatch_group_create();
 
     uint64_t* offs_ptr = offsets.data();
-    uint32_t n_batches = (num_chunks + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
-
-    printf("[APLZ] Pipeline : %u batches x %u chunks/batch (double-buffered)\n",
-           n_batches, BATCH_CHUNKS);
 
     CFTimeInterval t2_start = CACurrentMediaTime();
 
-    for (uint32_t b = 0; b < n_batches; b++) {
-        // スロットが空くまで待機 (前回の GPU + 書き出し完了を保証)
-        dispatch_semaphore_wait(buf_sem, DISPATCH_TIME_FOREVER);
+    // メガバッチループ: Pass1 再実行 → Pass2 ダブルバッファ
+    for (uint32_t mb = 0; mb < n_mega; mb++) {
+        uint32_t mc_start = mb * mb_chunks;
+        uint32_t mc_count = std::min(mb_chunks, num_chunks - mc_start);
 
-        uint32_t sl = b % N_BUFS;
-        uint32_t c_start = b * BATCH_CHUNKS;
-        uint32_t c_count = std::min(BATCH_CHUNKS, num_chunks - c_start);
+        // GPU Pass1 再実行 (このメガバッチ分のトークンを buf_compact に再生成)
+        dispatch_pass1(cq, pso1, buf_in, buf_sparse, buf_compact, buf_cnt,
+                        mc_start, mc_count, file_size);
 
-        // 出力バッファをゼロクリア (tans_encode はバイト単位でアペンドするため)
-        memset(slot_bs[sl].contents, 0, (size_t)c_count * N_STREAMS * BS_CAP);
+        // buf_cnt の内容をローカルにコピー (Pass2 非同期ループ中に上書きされないよう)
+        std::vector<uint32_t> mb_cnt(mc_count);
+        memcpy(mb_cnt.data(), buf_cnt.contents, mc_count * sizeof(uint32_t));
 
-        // GPU コマンド構築: buf_compact/buf_cnt をバッチオフセットで参照
-        id<MTLCommandBuffer> cb = [cq commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:pso2];
-        [enc setBuffer:buf_compact offset:(size_t)c_start * CHUNK_SIZE * sizeof(LzToken) atIndex:0];
-        [enc setBuffer:buf_cnt     offset:(size_t)c_start * sizeof(uint32_t)             atIndex:1];
-        [enc setBuffer:buf_sym     offset:0 atIndex:2];
-        [enc setBuffer:buf_enc     offset:0 atIndex:3];
-        [enc setBuffer:slot_bs[sl]   offset:0 atIndex:4];
-        [enc setBuffer:slot_bsz[sl]  offset:0 atIndex:5];
-        [enc setBuffer:slot_ccomp[sl] offset:0 atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(c_count, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
-        [enc endEncoding];
+        // Pass2 ダブルバッファ バッチパイプライン (メガバッチ内)
+        uint32_t mb_n_batches = (mc_count + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
+        for (uint32_t b = 0; b < mb_n_batches; b++) {
+            dispatch_semaphore_wait(buf_sem, DISPATCH_TIME_FOREVER);
 
-        // ブロックキャプチャ用ローカルコピー (ARC が retain)
-        id<MTLBuffer> cap_bs  = slot_bs[sl];
-        id<MTLBuffer> cap_bsz = slot_bsz[sl];
-        uint32_t cap_c_start = c_start;
-        uint32_t cap_c_count = c_count;
+            uint32_t sl = b % N_BUFS;
+            uint32_t lc_start = b * BATCH_CHUNKS;            // メガバッチ内ローカル
+            uint32_t lc_count = std::min(BATCH_CHUNKS, mc_count - lc_start);
+            uint32_t gc_start = mc_start + lc_start;          // グローバルチャンクID
 
-        dispatch_group_enter(done_grp);
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
-            // GPU 完了 → シリアルキューでファイル書き出し (順序保証)
-            dispatch_async(write_q, ^{
-                const uint8_t*  bs  = (const uint8_t*)cap_bs.contents;
-                const uint32_t* bsz = (const uint32_t*)cap_bsz.contents;
+            memset(slot_bs[sl].contents, 0, (size_t)lc_count * N_STREAMS * BS_CAP);
 
-                for (uint32_t lc = 0; lc < cap_c_count; lc++) {
-                    uint32_t gc = cap_c_start + lc;
-                    offs_ptr[gc] = (uint64_t)ftell(fout);
+            id<MTLCommandBuffer> cb = [cq commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pso2];
+            [enc setBuffer:buf_compact   offset:(size_t)lc_start * CHUNK_SIZE * sizeof(LzToken) atIndex:0];
+            [enc setBuffer:buf_cnt       offset:(size_t)lc_start * sizeof(uint32_t)             atIndex:1];
+            [enc setBuffer:buf_sym       offset:0 atIndex:2];
+            [enc setBuffer:buf_enc       offset:0 atIndex:3];
+            [enc setBuffer:slot_bs[sl]   offset:0 atIndex:4];
+            [enc setBuffer:slot_bsz[sl]  offset:0 atIndex:5];
+            [enc setBuffer:slot_ccomp[sl] offset:0 atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(lc_count, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+            [enc endEncoding];
 
-                    // token count (デコーダ用)
-                    fwrite(&cnt_ptr[gc], 4, 1, fout);
+            id<MTLBuffer> cap_bs  = slot_bs[sl];
+            id<MTLBuffer> cap_bsz = slot_bsz[sl];
+            uint32_t cap_gc_start = gc_start;
+            uint32_t cap_lc_count = lc_count;
+            // mb_cnt のデータをキャプチャ用にコピー
+            std::vector<uint32_t> cap_cnt(mb_cnt.begin() + lc_start,
+                                          mb_cnt.begin() + lc_start + lc_count);
 
-                    // stream sizes (uint32 → uint16)
-                    uint16_t ssz[256];
-                    for (uint32_t s = 0; s < 256; s++)
-                        ssz[s] = (uint16_t)bsz[(size_t)lc * 256 + s];
-                    fwrite(ssz, 2, 256, fout);
+            dispatch_group_enter(done_grp);
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+                dispatch_async(write_q, ^{
+                    const uint8_t*  bs  = (const uint8_t*)cap_bs.contents;
+                    const uint32_t* bsz = (const uint32_t*)cap_bsz.contents;
 
-                    // stream data
-                    for (uint32_t s = 0; s < 256; s++) {
-                        const uint8_t* sdata = bs + ((size_t)lc * 256 + s) * BS_CAP;
-                        fwrite(sdata, 1, ssz[s], fout);
+                    for (uint32_t lc = 0; lc < cap_lc_count; lc++) {
+                        uint32_t gc = cap_gc_start + lc;
+                        offs_ptr[gc] = (uint64_t)ftell(fout);
+
+                        uint32_t tc = cap_cnt[lc];
+                        fwrite(&tc, 4, 1, fout);
+
+                        uint16_t ssz[256];
+                        for (uint32_t s = 0; s < 256; s++)
+                            ssz[s] = (uint16_t)bsz[(size_t)lc * 256 + s];
+                        fwrite(ssz, 2, 256, fout);
+
+                        for (uint32_t s = 0; s < 256; s++) {
+                            const uint8_t* sdata = bs + ((size_t)lc * 256 + s) * BS_CAP;
+                            fwrite(sdata, 1, ssz[s], fout);
+                        }
                     }
-                }
 
-                // スロット解放 → メインスレッドが次バッチで再利用可能に
-                dispatch_semaphore_signal(buf_sem);
-                dispatch_group_leave(done_grp);
-            });
-        }];
-        [cb commit];  // ノンブロッキング: GPU 実行開始
+                    dispatch_semaphore_signal(buf_sem);
+                    dispatch_group_leave(done_grp);
+                });
+            }];
+            [cb commit];
+        }
+
+        // メガバッチ内の全バッチ完了を待機してから次のメガバッチへ
+        // (次の Pass1 が buf_compact/buf_cnt を上書きするため)
+        dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
     }
 
-    // 全バッチの GPU + 書き出し完了を待機
-    dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
-
     CFTimeInterval t2_end = CACurrentMediaTime();
-    printf("[APLZ] Pass 2   : %.2f ms  (tANS encode, pipelined)\n", (t2_end-t2_start)*1000.0);
+    printf("[APLZ] Pass 1b+2: %.2f ms  (LZ77 re-run + tANS encode, streaming)\n",
+           (t2_end-t2_start)*1000.0);
 
     // ── シークテーブル書き戻し ──────────────────────────────────────────────
     fseek(fout, seek_tbl_pos, SEEK_SET);
@@ -440,11 +495,9 @@ static int compress(const char* in_path, const char* out_path, const char* shade
 // ═══════════════════════════════════════════════════════════════════════════════
 // 解凍モード (-d)
 //
-// パイプライン:
-//   CPU がバッチ N+1 のチャンクデータをファイルから読み込む間に、
-//   GPU がバッチ N の tANS デコード + LZ77 展開を実行する。
-//   dispatch_semaphore でスロットの排他制御を行い、
-//   各バッチの出力は buf_out の正しいオフセットに直接書き込まれる。
+// ストリーミング・パイプライン:
+//   メガバッチ (32MB) 単位で buf_out を確保し、GPU デコード後に fwrite。
+//   各メガバッチ内は既存のダブルバッファ パイプラインで処理する。
 // ═══════════════════════════════════════════════════════════════════════════════
 static int decompress(const char* in_path, const char* out_path, const char* shader_path) {
     // ── .aplz ファイルヘッダ読み込み ────────────────────────────────────────
@@ -469,8 +522,8 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
     const uint32_t num_chunks = hdr.num_chunks;
     const uint64_t original_size = hdr.original_size;
 
-    std::vector<uint64_t> offsets(num_chunks);
-    fread(offsets.data(), 8, num_chunks, f);
+    std::vector<uint64_t> chunk_offsets(num_chunks);
+    fread(chunk_offsets.data(), 8, num_chunks, f);
 
     printf("[APLZ] Decompress: %s\n", in_path);
     printf("[APLZ] Original  : %llu bytes (%.2f MB)\n",
@@ -491,7 +544,6 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
     id<MTLCommandQueue> cq = [dev newCommandQueue];
     id<MTLLibrary> lib = compile_shader(dev, shader_path);
 
-    // PSO 構築
     NSError* err = nil;
     id<MTLFunction> fn_tans = [lib newFunctionWithName:@"tans_decode"];
     id<MTLFunction> fn_lz77 = [lib newFunctionWithName:@"lz77_decode"];
@@ -514,9 +566,10 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                                              options:MTLResourceStorageModeShared];
     memcpy(buf_dec.contents, dec_table_cpu, ANS_L * sizeof(DecodeEntry));
 
-    // 出力バッファ: 元ファイルサイズ分を一括確保。
-    // 各バッチが自分のチャンク領域にオフセット指定で直接書き込む。
-    id<MTLBuffer> buf_out = [dev newBufferWithLength:(size_t)original_size
+    // ── 出力バッファ: メガバッチサイズのみ確保 (O(1) メモリ) ────────────────
+    const uint32_t mb_chunks = std::min((uint32_t)MEGA_BATCH_CHUNKS, num_chunks);
+    const size_t mb_out_size = (size_t)mb_chunks * CHUNK_SIZE;
+    id<MTLBuffer> buf_out = [dev newBufferWithLength:mb_out_size
                                              options:MTLResourceStorageModeShared];
     if (!buf_out) {
         fprintf(stderr, "[APLZ] Output buffer alloc failed.\n"); return EXIT_FAILURE;
@@ -535,99 +588,112 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                                          options:MTLResourceStorageModeShared];
     }
 
+    // ── 出力ファイル ────────────────────────────────────────────────────────
+    FILE* fout = fopen(out_path, "wb");
+    if (!fout) { perror("fopen"); return EXIT_FAILURE; }
+
     // ── パイプライン同期 ────────────────────────────────────────────────────
     dispatch_semaphore_t buf_sem = dispatch_semaphore_create(N_BUFS);
     dispatch_group_t done_grp = dispatch_group_create();
 
-    uint32_t n_batches = (num_chunks + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
-    printf("[APLZ] Pipeline  : %u batches x %u chunks/batch (double-buffered)\n",
-           n_batches, BATCH_CHUNKS);
+    uint32_t n_mega = (num_chunks + mb_chunks - 1) / mb_chunks;
+    uint32_t total_batches = (num_chunks + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
+    printf("[APLZ] Pipeline  : %u batches x %u chunks/batch (double-buffered, %u mega-batches)\n",
+           total_batches, BATCH_CHUNKS, n_mega);
 
     CFTimeInterval t_total_start = CACurrentMediaTime();
 
-    for (uint32_t b = 0; b < n_batches; b++) {
-        // スロット排他: 前回の GPU 完了を保証してからバッファ再利用
-        dispatch_semaphore_wait(buf_sem, DISPATCH_TIME_FOREVER);
+    for (uint32_t mb = 0; mb < n_mega; mb++) {
+        uint32_t mc_start = mb * mb_chunks;
+        uint32_t mc_count = std::min(mb_chunks, num_chunks - mc_start);
 
-        uint32_t sl = b % N_BUFS;
-        uint32_t c_start = b * BATCH_CHUNKS;
-        uint32_t c_count = std::min(BATCH_CHUNKS, num_chunks - c_start);
+        uint32_t mb_n_batches = (mc_count + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
 
-        // ── CPU: ファイルからバッチデータ読み込み ─────────────────────────
-        // GPU が前バッチ (別スロット) をデコード中に並行して実行される
-        uint8_t*  bs_data   = (uint8_t*)slot_bs[sl].contents;
-        uint32_t* bsz_data  = (uint32_t*)slot_bsz[sl].contents;
-        uint32_t* tcnt_data = (uint32_t*)slot_tcnt[sl].contents;
-        memset(bs_data, 0, (size_t)BATCH_CHUNKS * N_STREAMS * BS_CAP);
+        for (uint32_t b = 0; b < mb_n_batches; b++) {
+            dispatch_semaphore_wait(buf_sem, DISPATCH_TIME_FOREVER);
 
-        for (uint32_t lc = 0; lc < c_count; lc++) {
-            uint32_t gc = c_start + lc;
-            fseek(f, (long)offsets[gc], SEEK_SET);
-            fread(&tcnt_data[lc], 4, 1, f);
+            uint32_t sl = b % N_BUFS;
+            uint32_t lc_start = b * BATCH_CHUNKS;
+            uint32_t lc_count = std::min(BATCH_CHUNKS, mc_count - lc_start);
+            uint32_t gc_start = mc_start + lc_start;
 
-            uint16_t ssz[256];
-            fread(ssz, 2, 256, f);
-            for (uint32_t s = 0; s < 256; s++) {
-                bsz_data[(size_t)lc * 256 + s] = (uint32_t)ssz[s];
-                fread(bs_data + ((size_t)lc * 256 + s) * BS_CAP, 1, ssz[s], f);
+            // ── CPU: ファイルからバッチデータ読み込み ─────────────────────
+            uint8_t*  bs_data   = (uint8_t*)slot_bs[sl].contents;
+            uint32_t* bsz_data  = (uint32_t*)slot_bsz[sl].contents;
+            uint32_t* tcnt_data = (uint32_t*)slot_tcnt[sl].contents;
+            memset(bs_data, 0, (size_t)BATCH_CHUNKS * N_STREAMS * BS_CAP);
+
+            for (uint32_t lc = 0; lc < lc_count; lc++) {
+                uint32_t gc = gc_start + lc;
+                fseek(f, (long)chunk_offsets[gc], SEEK_SET);
+                fread(&tcnt_data[lc], 4, 1, f);
+
+                uint16_t ssz[256];
+                fread(ssz, 2, 256, f);
+                for (uint32_t s = 0; s < 256; s++) {
+                    bsz_data[(size_t)lc * 256 + s] = (uint32_t)ssz[s];
+                    fread(bs_data + ((size_t)lc * 256 + s) * BS_CAP, 1, ssz[s], f);
+                }
             }
+
+            // ── GPU: tANS デコード + LZ77 展開 ──────────────────────────
+            // buf_out のオフセットはメガバッチ内ローカル
+            uint32_t local_out_offset = lc_start * CHUNK_SIZE;
+            uint32_t batch_bytes = (uint32_t)std::min(
+                (uint64_t)lc_count * CHUNK_SIZE,
+                original_size - (uint64_t)gc_start * CHUNK_SIZE);
+
+            id<MTLCommandBuffer> cb = [cq commandBuffer];
+
+            {
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pso_tans];
+                [enc setBuffer:slot_bs[sl]   offset:0 atIndex:0];
+                [enc setBuffer:slot_bsz[sl]  offset:0 atIndex:1];
+                [enc setBuffer:buf_dec       offset:0 atIndex:2];
+                [enc setBuffer:slot_tok[sl]  offset:0 atIndex:3];
+                [enc setBuffer:slot_tcnt[sl] offset:0 atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(lc_count, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+                [enc endEncoding];
+            }
+
+            {
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pso_lz77];
+                [enc setBuffer:slot_tok[sl]  offset:0 atIndex:0];
+                [enc setBuffer:slot_tcnt[sl] offset:0 atIndex:1];
+                [enc setBuffer:buf_out       offset:(size_t)local_out_offset atIndex:2];
+                [enc setBytes:&batch_bytes   length:4 atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(lc_count, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+                [enc endEncoding];
+            }
+
+            dispatch_group_enter(done_grp);
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+                dispatch_semaphore_signal(buf_sem);
+                dispatch_group_leave(done_grp);
+            }];
+            [cb commit];
         }
 
-        // ── GPU: tANS デコード + LZ77 展開 ──────────────────────────────
-        uint32_t batch_bytes = (uint32_t)std::min(
-            (uint64_t)c_count * CHUNK_SIZE,
-            original_size - (uint64_t)c_start * CHUNK_SIZE);
+        // メガバッチ内の全バッチ完了を待機
+        dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
 
-        id<MTLCommandBuffer> cb = [cq commandBuffer];
-
-        // tans_decode: ビットストリーム → トークン列
-        {
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:pso_tans];
-            [enc setBuffer:slot_bs[sl]   offset:0 atIndex:0];
-            [enc setBuffer:slot_bsz[sl]  offset:0 atIndex:1];
-            [enc setBuffer:buf_dec       offset:0 atIndex:2];
-            [enc setBuffer:slot_tok[sl]  offset:0 atIndex:3];
-            [enc setBuffer:slot_tcnt[sl] offset:0 atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(c_count, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // lz77_decode: トークン列 → 元データ (buf_out にオフセット書き込み)
-        {
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:pso_lz77];
-            [enc setBuffer:slot_tok[sl]  offset:0 atIndex:0];
-            [enc setBuffer:slot_tcnt[sl] offset:0 atIndex:1];
-            [enc setBuffer:buf_out       offset:(size_t)c_start * CHUNK_SIZE atIndex:2];
-            [enc setBytes:&batch_bytes   length:4 atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(c_count, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
-            [enc endEncoding];
-        }
-
-        dispatch_group_enter(done_grp);
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
-            dispatch_semaphore_signal(buf_sem);
-            dispatch_group_leave(done_grp);
-        }];
-        [cb commit];  // ノンブロッキング: メインスレッドは次バッチの読み込みへ
+        // buf_out の有効部分をファイルに書き出し
+        size_t mb_bytes = std::min(
+            (size_t)mc_count * CHUNK_SIZE,
+            (size_t)(original_size - (uint64_t)mc_start * CHUNK_SIZE));
+        fwrite(buf_out.contents, 1, mb_bytes, fout);
     }
 
-    // 全バッチの GPU 完了を待機
-    dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
     fclose(f);
+    fclose(fout);
 
     CFTimeInterval t_total_end = CACurrentMediaTime();
     double total_ms = (t_total_end - t_total_start) * 1000.0;
     double throughput = (original_size / (1024.0 * 1024.0)) / (t_total_end - t_total_start);
-
-    // ── 出力書き出し ────────────────────────────────────────────────────────
-    FILE* fout = fopen(out_path, "wb");
-    if (!fout) { perror("fopen"); return EXIT_FAILURE; }
-    fwrite(buf_out.contents, 1, (size_t)original_size, fout);
-    fclose(fout);
 
     printf("[APLZ] Output    : %s (%llu bytes)\n", out_path, (unsigned long long)original_size);
     printf("[APLZ] Total     : %.2f ms  (%.1f MB/s)\n", total_ms, throughput);

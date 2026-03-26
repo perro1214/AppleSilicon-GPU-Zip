@@ -10,6 +10,7 @@ Metal Compute Shader (MSL 3.0) + tANS (Asymmetric Numeral Systems) を組み合�
 - **256 Interleaved tANS**: 各スレッドが独立した ANS 状態を保持し、256 本のビットストリームを並列にエンコード/デコード
 - **並列 LZ77 デコード**: 非重複マッチは 256 スレッドで並列コピー、重複マッチ (dist < len) はシリアルフォールバック。Barrier 削減最適化付き
 - **非同期ダブルバッファリング**: GCD (`dispatch_semaphore` / `dispatch_group`) によるバッチパイプライン。GPU 実行と CPU I/O を完全にオーバーラップ
+- **O(1) ストリーミング・メモリ**: 入力サイズに依存しない固定メモリ使用量。メガバッチ (32MB) 単位で処理し、5GB+ のファイルも安定動作
 - **Perfect Round-trip**: 圧縮→解凍でバイトレベルの完全一致を保証
 
 ## アーキテクチャ
@@ -17,35 +18,39 @@ Metal Compute Shader (MSL 3.0) + tANS (Asymmetric Numeral Systems) を組み合�
 ### 圧縮パイプライン (`-c`)
 
 ```
-mmap(input)
-    |  zero-copy MTLBuffer (Apple Silicon UMA)
+mmap(input)  ← zero-copy MTLBuffer (Apple Silicon UMA)
+    |
     v
-+--------------------------------------------------+
-|  GPU Pass 1: compress_chunk                      |
-|  Phase A-1  Hash table init                      |
-|  Phase A-2  3-gram hash (atomic_fetch_min x 2)   |
-|  Phase A-3  LZ77 match search -> sparse[]        |
-|  Phase B    Greedy overlap resolution -> compact[]|
-|  1 threadgroup (256 threads) = 1 chunk (64 KB)   |
-+--------------------------------------------------+
-    | compact tokens + count
+╔══════════════════════════════════════════════════════╗
+║  Phase A: GPU Pass 1 × mega-batch (32MB streaming)  ║
+║  ┌────────────────────────────────────────────────┐  ║
+║  │ compress_chunk (512 chunks/mega-batch)         │  ║
+║  │   A-1  Hash table init                         │  ║
+║  │   A-2  3-gram hash (atomic_fetch_min x 2)      │  ║
+║  │   A-3  LZ77 match search -> sparse[]           │  ║
+║  │   B    Greedy overlap resolution -> compact[]   │  ║
+║  │   1 threadgroup (256 threads) = 1 chunk (64 KB) │  ║
+║  └────────────────────────────────────────────────┘  ║
+║  → histogram 累積 → バッファ再利用 → 次の 32MB        ║
+╚══════════════════════════════════════════════════════╝
+    | accumulated histogram (512 symbols)
     v
-+--------------------------------------------------+
-|  CPU: tANS table construction                    |
-|  1. Histogram (512 symbols)                      |
-|  2. Normalize (sum = L = 1024)                   |
-|  3. Duda's spread table (step = 643)             |
-|  4. Encode table                                 |
-+--------------------------------------------------+
++------------------------------------------------------+
+|  Phase B: CPU tANS table construction                |
+|  Normalize → Duda's spread → Encode table            |
++------------------------------------------------------+
     | SymInfo[512] + enc_table[1024]
     v
-+--------------------------------------------------+
-|  GPU Pass 2: tans_encode (double-buffered batch) |
-|  256 interleaved ANS streams                     |
-|  + sentinel bit + SIMD prefix sum                |
-|  dispatch_semaphore: slot exclusion               |
-|  addCompletedHandler -> serial write queue        |
-+--------------------------------------------------+
+╔══════════════════════════════════════════════════════╗
+║  Phase C: Pass1 再実行 + Pass2 (mega-batch stream)   ║
+║  for each mega-batch (32MB):                         ║
+║    GPU Pass1 再実行 → compact tokens 再生成           ║
+║    ┌────────────────────────────────────────────────┐ ║
+║    │ Pass2: tans_encode (double-buffered batch)     │ ║
+║    │ 256 interleaved ANS streams                    │ ║
+║    │ dispatch_semaphore → serial write queue         │ ║
+║    └────────────────────────────────────────────────┘ ║
+╚══════════════════════════════════════════════════════╝
     | 256 x bitstreams (async write overlap)
     v
   .aplz file
@@ -57,24 +62,22 @@ mmap(input)
 read .aplz header + tANS tables
     |
     v
-+--------------------------------------------------+
-|  CPU: Decode table construction                  |
-|  SymInfo[512] -> spread table -> DecodeEntry[L]  |
-+--------------------------------------------------+
++------------------------------------------------------+
+|  CPU: Decode table construction                      |
+|  SymInfo[512] -> spread table -> DecodeEntry[L]      |
++------------------------------------------------------+
     | dec_table[1024]
     v
-+--------------------------------------------------+
-|  Double-buffered batch pipeline                  |
-|  CPU: read batch N+1  |  GPU: decode batch N     |
-|  (dispatch_semaphore slot exclusion)             |
-|                                                  |
-|  Per batch:                                      |
-|    GPU Pass 1: tans_decode                       |
-|    256 streams: reverse bitstream playback       |
-|    GPU Pass 2: lz77_decode                       |
-|    Hybrid serial/parallel expansion              |
-|    -> buf_out[chunk_offset] (direct write)       |
-+--------------------------------------------------+
+╔══════════════════════════════════════════════════════╗
+║  Mega-batch streaming pipeline (32MB buf_out)        ║
+║  for each mega-batch:                                ║
+║    ┌──────────────────────────────────────────────┐  ║
+║    │ Double-buffered batch pipeline               │  ║
+║    │ CPU: read batch N+1 | GPU: decode batch N    │  ║
+║    │   tans_decode → lz77_decode → buf_out        │  ║
+║    └──────────────────────────────────────────────┘  ║
+║    → fwrite(buf_out) → バッファ再利用               ║
+╚══════════════════════════════════════════════════════╝
     v
   restored original data
 ```
@@ -156,20 +159,22 @@ aplz info myfile.txt.aplz
 
 | Data | Input | Output | Ratio | Throughput |
 |---|---|---|---|---|
-| Text (repeating pattern) | 1.14 MB | 36 KB | 3.0% | 36 MB/s |
-| Random binary | 10 MB | 10.9 MB | 104% | 84 MB/s |
-| **Text (large)** | **100 MB** | **2.9 MB** | **2.8%** | **157 MB/s** |
+| Text (repeating pattern) | 1 MB | 30 KB | 3.0% | 29 MB/s |
+| Text (large) | 100 MB | 2.9 MB | 2.8% | 168 MB/s |
+| Random binary | 2 GB | 2.1 GB | 105% | 146 MB/s |
+| **Text (5 GB)** | **5 GB** | **150 MB** | **2.8%** | **169 MB/s** |
 
 ### 解凍
 
 | Data | Speed | Notes |
 |---|---|---|
-| Text (1.14 MB) | 280 MB/s | 1 batch, pipeline overhead minimal |
-| Random (10 MB) | 140 MB/s | 5 batches, mostly literals |
-| **Text (100 MB)** | **4.4 GB/s** | **50 batches, full pipeline overlap** |
+| Text (1 MB) | 176 MB/s | 1 mega-batch, pipeline overhead minimal |
+| Text (100 MB) | 1.5 GB/s | 4 mega-batches, full pipeline overlap |
+| Random (2 GB) | 243 MB/s | 64 mega-batches, mostly literals |
+| **Text (5 GB)** | **1.0 GB/s** | **160 mega-batches, O(1) memory streaming** |
 
 > Random data is incompressible so output slightly exceeds input (tANS/distance field overhead).
-> Large file performance demonstrates the benefit of the async double-buffered pipeline.
+> Memory usage is constant (~512 MB) regardless of input size thanks to mega-batch streaming.
 
 ## ソースファイル構成
 
@@ -177,7 +182,7 @@ aplz info myfile.txt.aplz
 |---|---|
 | `APLZ.h` | Shared header (structs & constants for CPU and GPU) |
 | `compression.metal` | GPU kernels (MSL 3.0): compress_chunk, tans_encode, tans_decode, lz77_decode |
-| `main.mm` | Host driver (Objective-C++): async double-buffered compress/decompress pipelines |
+| `main.mm` | Host driver (Objective-C++): O(1) streaming mega-batch + async double-buffered pipelines |
 | `aplz` | User-facing CLI wrapper (Bash): file/directory support, tar integration |
 | `install.sh` | Installer: optimized build (-O3 -flto) + system-wide deployment |
 | `setup_finder.sh` | macOS Finder Quick Action generator (right-click compress/extract) |
@@ -191,12 +196,14 @@ aplz info myfile.txt.aplz
 - **ANS Decoding**: Reverse playback from final state, sentinel via `clz()`, O(1) decode table lookup
 - **LZ77 Parallel Decode**: Hybrid approach -- serial fallback for token count > 4096, parallel cooperative copy with barrier reduction for dense match streams
 - **Async Double Buffering**: GCD-based batch pipeline (32 chunks/batch, 2 slots). `dispatch_semaphore` for slot exclusion, `addCompletedHandler` + serial `dispatch_queue` for ordered async writes
+- **O(1) Streaming Memory**: Mega-batch architecture (512 chunks = 32MB per batch). Pass 1 runs twice (histogram collection + encode) to avoid temporary files. Buffers are reused across mega-batches. Fixed ~512MB memory regardless of input size.
 
 ## 既知の制約
 
 - **BS_CAP = 512 B**: 1 stream max output is 512 bytes. Highly incompressible data may truncate bits.
 - **Global tANS table**: Single table for entire file. Per-chunk adaptive tables could improve compression ratio.
 - **Chunk size fixed at 64 KB**: Tunable but requires rebuild.
+- **Pass 1 double execution**: Streaming architecture requires running LZ77 pass twice (histogram + encode). GPU compute cost ~2x but avoids multi-GB temporary files.
 
 ## License
 

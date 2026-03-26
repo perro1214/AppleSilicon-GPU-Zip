@@ -316,28 +316,34 @@ mkdir -p "$SERVICES_DIR"
 COMPRESS_SCRIPT='export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 exec >> /tmp/aplz_service.log 2>&1
 echo "=== $(date) ==="
+_cleanup_tmp=""
+trap "rm -rf \"$_cleanup_tmp\" 2>/dev/null" EXIT INT TERM
 for f in "$@"; do
     base="$(basename "$f")"
     dir="$(dirname "$f")"
     tmp="/tmp/aplz_$$_${base}"
+    _cleanup_tmp="$tmp"
     rc=0
     echo "processing: $f"
     if [ -d "$f" ]; then
-        # ディレクトリ: /tmp にコピーしてから tar+圧縮
-        cp -R "$f" "$tmp"
+        # ディレクトリ: /tmp にコピー (Google Drive対応: -c でクローンせずバイトコピー)
+        mkdir -p "$tmp"
+        for item in "$f"/*; do
+            [ -e "$item" ] && cp "$(readlink -f "$item" 2>/dev/null || echo "$item")" "$tmp/" 2>/dev/null || true
+        done
         '"${APLZ_PATH}"' compress "$tmp" "${dir}/${base}.tar.aplz"
         rc=$?
         rm -rf "$tmp"
     else
-        # ファイル: /tmp にコピーしてから圧縮
-        cp "$f" "$tmp"
+        cp "$f" "$tmp" 2>/dev/null || cat "$f" > "$tmp"
         '"${APLZ_PATH}"' compress "$tmp"
         rc=$?
         if [ $rc -eq 0 ] && [ -f "${tmp}.aplz" ]; then
-            mv "${tmp}.aplz" "${dir}/${base}.aplz"
+            mv "${tmp}.aplz" "${dir}/${base}.aplz" 2>/dev/null || cp "${tmp}.aplz" "${dir}/${base}.aplz"
         fi
         rm -f "$tmp" "${tmp}.aplz"
     fi
+    _cleanup_tmp=""
     echo "exit code: $rc"
     if [ $rc -eq 0 ]; then
         osascript -e "display notification \"圧縮完了: ${base}\" with title \"APLZ\""
@@ -359,35 +365,30 @@ create_workflow "APLZ で圧縮" "$COMPRESS_SCRIPT" "$COMPRESS_FILE_TYPES"
 EXTRACT_SCRIPT='export PATH="/usr/local/bin:$HOME/.local/bin:$PATH"
 exec >> /tmp/aplz_service.log 2>&1
 echo "=== $(date) ==="
+_cleanup_tmp=""
+trap "rm -rf \"$_cleanup_tmp\" 2>/dev/null" EXIT INT TERM
 for f in "$@"; do
     base="$(basename "$f")"
     dir="$(dirname "$f")"
     tmp="/tmp/aplz_$$_${base}"
+    _cleanup_tmp="$tmp"
     echo "extracting: $f"
-    # サンドボックス回避: /tmp 経由で処理
-    cp "$f" "$tmp"
-    # 出力ファイル名を決定 (.aplz / .tar.aplz を除去)
+    cp "$f" "$tmp" 2>/dev/null || cat "$f" > "$tmp"
     out_base="${base%.aplz}"
     out_base="${out_base%.tar}"
-    if [ "$base" != "${base%.tar.aplz}" ]; then
-        # .tar.aplz → /tmp に解凍してから展開
-        '"${APLZ_PATH}"' extract "$tmp" "/tmp"
-        rc=$?
-    else
-        '"${APLZ_PATH}"' extract "$tmp" "/tmp"
-        rc=$?
-    fi
+    '"${APLZ_PATH}"' extract "$tmp" "/tmp"
+    rc=$?
     echo "exit code: $rc"
     if [ $rc -eq 0 ]; then
-        # 解凍結果を元のディレクトリに移動
         for out in /tmp/"$out_base" /tmp/"$out_base".tar; do
-            [ -e "$out" ] && mv "$out" "$dir/" && break
+            [ -e "$out" ] && mv "$out" "$dir/" 2>/dev/null && break
         done
         osascript -e "display notification \"解凍完了: ${base}\" with title \"APLZ\""
     else
         osascript -e "display notification \"解凍失敗: ${base}\" with title \"APLZ\""
     fi
     rm -f "$tmp"
+    _cleanup_tmp=""
 done'
 
 # NSSendFileTypes: 解凍も全ファイルを対象 (.aplz 拡張子の UTI は未登録のため)
