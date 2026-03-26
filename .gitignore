@@ -1,0 +1,28 @@
+# Build artifacts
+gpu_zip
+*.o
+*.air
+*.metallib
+
+# Test data & output
+*.aplz
+*.bin
+decoded*
+
+# macOS
+.DS_Store
+._*
+
+# Xcode
+*.xcworkspace/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+build/
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
