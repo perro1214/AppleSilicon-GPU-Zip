@@ -80,7 +80,7 @@ do_compress() {
         # ディレクトリ → tar → compress
         local dir_name
         dir_name="$(basename "${input%/}")"
-        [[ -z "$output" ]] && output="${dir_name}.tar.aplz"
+        [[ -z "$output" ]] && output="$(dirname "${input%/}")/${dir_name}.tar.aplz"
 
         echo "==> Archiving directory: ${input} → tar"
         TMP_TAR="$(mktemp /tmp/aplz_XXXXXX.tar)"

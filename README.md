@@ -115,6 +115,8 @@ macOS + Xcode Command Line Tools が必要。
 ./setup_finder.sh uninstall
 ```
 
+Google Drive やクラウドストレージ上のファイルにも対応。サービス実行時は自動的に `/tmp` 経由で処理することで、macOS サンドボックス制限を回避する。
+
 ## 使い方
 
 ### aplz コマンド (推奨)
