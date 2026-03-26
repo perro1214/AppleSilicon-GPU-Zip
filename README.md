@@ -90,44 +90,62 @@ read .aplz header + tANS tables
 | 2080 | 8xN B | `chunk_offsets[N]` (seek table) |
 | ... | variable | Chunk data (per chunk: token_cnt + stream_sizes[256] + streams) |
 
-## ビルド
+## インストール
 
 macOS + Xcode Command Line Tools が必要。
 
 ```bash
-./build.sh
+# ~/.local/bin にインストール (-O3 -flto 最適化ビルド)
+./install.sh
+
+# /usr/local/bin にインストール (sudo 必要)
+./install.sh /usr/local
+
+# アンインストール
+./install.sh uninstall
 ```
 
-ビルド成果物:
-- `gpu_zip` -- 実行バイナリ
-- `compression.metallib` -- プリコンパイル済みシェーダ (ランタイムコンパイルも可)
+### Finder 統合 (オプション)
 
-クリーン:
 ```bash
-./build.sh clean
+# 右クリック →「APLZ で圧縮」「APLZ で解凍」を追加
+./setup_finder.sh
+
+# 削除
+./setup_finder.sh uninstall
 ```
 
 ## 使い方
 
+### aplz コマンド (推奨)
+
 ```bash
-# 圧縮
-./gpu_zip -c <input> <output.aplz> compression.metal
+# ファイル圧縮
+aplz compress myfile.txt              → myfile.txt.aplz
+
+# ディレクトリ圧縮 (自動 tar)
+aplz compress myproject/              → myproject.tar.aplz
 
 # 解凍
+aplz extract myfile.txt.aplz          → myfile.txt
+aplz extract myproject.tar.aplz       → myproject/
+
+# ファイル情報
+aplz info myfile.txt.aplz
+```
+
+### gpu_zip (低レベル API)
+
+```bash
+./gpu_zip -c <input> <output.aplz> compression.metal
 ./gpu_zip -d <input.aplz> <output> compression.metal
 ```
 
-例:
+### 開発用ビルド
 
 ```bash
-# テスト用データ生成
-python3 -c "import sys; sys.stdout.buffer.write((b'hello world ' * 100000)[:1200000])" > test_text.bin
-dd if=/dev/urandom of=test_random.bin bs=1M count=10 2>/dev/null
-
-# 圧縮 + 解凍 + 検証
-./gpu_zip -c test_text.bin out.aplz compression.metal
-./gpu_zip -d out.aplz decoded.bin compression.metal
-cmp test_text.bin decoded.bin  # Perfect Match
+./build.sh        # -O2 ビルド
+./build.sh clean   # 成果物削除
 ```
 
 ## パフォーマンス (Apple M4)
@@ -157,8 +175,11 @@ cmp test_text.bin decoded.bin  # Perfect Match
 |---|---|
 | `APLZ.h` | Shared header (structs & constants for CPU and GPU) |
 | `compression.metal` | GPU kernels (MSL 3.0): compress_chunk, tans_encode, tans_decode, lz77_decode |
-| `main.mm` | Host driver (Objective-C++): compress/decompress pipelines |
-| `build.sh` | Build script |
+| `main.mm` | Host driver (Objective-C++): async double-buffered compress/decompress pipelines |
+| `aplz` | User-facing CLI wrapper (Bash): file/directory support, tar integration |
+| `install.sh` | Installer: optimized build (-O3 -flto) + system-wide deployment |
+| `setup_finder.sh` | macOS Finder Quick Action generator (right-click compress/extract) |
+| `build.sh` | Development build script |
 
 ## 技術詳細
 

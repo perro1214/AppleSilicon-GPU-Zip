@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# aplz — APLZ 統合ラッパースクリプト
+#
+# Usage:
+#   aplz compress <file_or_dir> [output]
+#   aplz extract  <file.aplz|file.tar.aplz> [output_dir]
+#   aplz info     <file.aplz|file.tar.aplz>
+#
+# ファイル指定時: input → input.aplz
+# ディレクトリ指定時: dir/ → tar → gpu_zip → dir.tar.aplz
+# 解凍時: .tar.aplz なら tar 展開まで自動実行
+
+set -euo pipefail
+
+# ─── インストールパスの解決 ──────────────────────────────────────────────────
+# aplz と同じディレクトリに gpu_zip / compression.metal があることを期待する。
+# install.sh が全てを同じ PREFIX/bin に配置する。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+GPU_ZIP="${SCRIPT_DIR}/gpu_zip"
+SHADER="${SCRIPT_DIR}/compression.metal"
+
+if [[ ! -x "$GPU_ZIP" ]]; then
+    echo "Error: gpu_zip not found at ${GPU_ZIP}" >&2
+    echo "Run install.sh first." >&2
+    exit 1
+fi
+if [[ ! -f "$SHADER" ]]; then
+    echo "Error: compression.metal not found at ${SHADER}" >&2
+    exit 1
+fi
+
+# ─── ヘルパー ────────────────────────────────────────────────────────────────
+usage() {
+    cat <<'USAGE'
+APLZ — Apple Silicon GPU Compression Tool
+
+Usage:
+  aplz compress <file_or_dir> [output]    Compress a file or directory
+  aplz extract  <file> [output_dir]       Extract an .aplz or .tar.aplz file
+  aplz info     <file>                    Show file header info
+
+Examples:
+  aplz compress photo.png                 → photo.png.aplz
+  aplz compress myproject/                → myproject.tar.aplz
+  aplz extract  photo.png.aplz            → photo.png
+  aplz extract  myproject.tar.aplz        → myproject/
+USAGE
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "${TMP_TAR:-}" && -f "${TMP_TAR}" ]]; then
+        rm -f "$TMP_TAR"
+    fi
+    return 0
+}
+trap cleanup EXIT
+
+human_size() {
+    local bytes=$1
+    if   (( bytes >= 1073741824 )); then printf "%.2f GB" "$(echo "$bytes / 1073741824" | bc -l)"
+    elif (( bytes >= 1048576 ));    then printf "%.2f MB" "$(echo "$bytes / 1048576" | bc -l)"
+    elif (( bytes >= 1024 ));       then printf "%.2f KB" "$(echo "$bytes / 1024" | bc -l)"
+    else printf "%d B" "$bytes"
+    fi
+}
+
+# ─── compress サブコマンド ───────────────────────────────────────────────────
+do_compress() {
+    local input="$1"
+    local output="${2:-}"
+
+    if [[ ! -e "$input" ]]; then
+        echo "Error: '$input' not found." >&2
+        exit 1
+    fi
+
+    if [[ -d "$input" ]]; then
+        # ディレクトリ → tar → compress
+        local dir_name
+        dir_name="$(basename "${input%/}")"
+        [[ -z "$output" ]] && output="${dir_name}.tar.aplz"
+
+        echo "==> Archiving directory: ${input} → tar"
+        TMP_TAR="$(mktemp /tmp/aplz_XXXXXX.tar)"
+        tar cf "$TMP_TAR" -C "$(dirname "${input%/}")" "$dir_name"
+
+        local tar_size
+        tar_size=$(stat -f%z "$TMP_TAR" 2>/dev/null || stat -c%s "$TMP_TAR" 2>/dev/null)
+        echo "    tar size: $(human_size "$tar_size")"
+
+        echo "==> Compressing: tar → ${output}"
+        "$GPU_ZIP" -c "$TMP_TAR" "$output" "$SHADER"
+        rm -f "$TMP_TAR"
+        TMP_TAR=""
+    else
+        # 単一ファイル → compress
+        [[ -z "$output" ]] && output="${input}.aplz"
+
+        echo "==> Compressing: ${input} → ${output}"
+        "$GPU_ZIP" -c "$input" "$output" "$SHADER"
+    fi
+
+    local in_size out_size
+    if [[ -d "$input" ]]; then
+        in_size=$(stat -f%z "$TMP_TAR" 2>/dev/null || echo 0)
+    else
+        in_size=$(stat -f%z "$input" 2>/dev/null || stat -c%s "$input" 2>/dev/null)
+    fi
+    out_size=$(stat -f%z "$output" 2>/dev/null || stat -c%s "$output" 2>/dev/null)
+
+    echo ""
+    echo "Done: $(human_size "$out_size")  ($(basename "$output"))"
+}
+
+# ─── extract サブコマンド ────────────────────────────────────────────────────
+do_extract() {
+    local input="$1"
+    local output_dir="${2:-}"
+
+    if [[ ! -f "$input" ]]; then
+        echo "Error: '$input' not found." >&2
+        exit 1
+    fi
+
+    local is_tar_aplz=false
+    if [[ "$input" == *.tar.aplz ]]; then
+        is_tar_aplz=true
+    elif [[ "$input" != *.aplz ]]; then
+        echo "Error: Expected .aplz or .tar.aplz file." >&2
+        exit 1
+    fi
+
+    if $is_tar_aplz; then
+        # .tar.aplz → decompress → tar extract
+        TMP_TAR="$(mktemp /tmp/aplz_XXXXXX.tar)"
+
+        echo "==> Decompressing: ${input} → tar"
+        "$GPU_ZIP" -d "$input" "$TMP_TAR" "$SHADER"
+
+        [[ -z "$output_dir" ]] && output_dir="."
+        echo "==> Extracting tar → ${output_dir}/"
+        tar xf "$TMP_TAR" -C "$output_dir"
+        rm -f "$TMP_TAR"
+        TMP_TAR=""
+
+        echo ""
+        echo "Done: extracted to ${output_dir}/"
+    else
+        # .aplz → decompress
+        local base_name
+        base_name="$(basename "$input" .aplz)"
+        local out_file="${output_dir:-$base_name}"
+
+        echo "==> Decompressing: ${input} → ${out_file}"
+        "$GPU_ZIP" -d "$input" "$out_file" "$SHADER"
+
+        local out_size
+        out_size=$(stat -f%z "$out_file" 2>/dev/null || stat -c%s "$out_file" 2>/dev/null)
+        echo ""
+        echo "Done: $(human_size "$out_size")  ($(basename "$out_file"))"
+    fi
+}
+
+# ─── info サブコマンド ───────────────────────────────────────────────────────
+do_info() {
+    local input="$1"
+    if [[ ! -f "$input" ]]; then
+        echo "Error: '$input' not found." >&2
+        exit 1
+    fi
+
+    local file_size
+    file_size=$(stat -f%z "$input" 2>/dev/null || stat -c%s "$input" 2>/dev/null)
+
+    # FileHeader の先頭 24 バイトを読み取り
+    local magic version orig_size chunk_size num_chunks
+    magic=$(head -c 4 "$input")
+    if [[ "$magic" != "APLZ" ]]; then
+        echo "Error: Not an APLZ file (bad magic)." >&2
+        exit 1
+    fi
+
+    # python3 でバイナリヘッダを確実に解析
+    read -r version orig_size num_chunks < <(
+        python3 -c "
+import struct, sys
+with open(sys.argv[1], 'rb') as f:
+    data = f.read(24)
+magic, ver, orig, cs, nc = struct.unpack('<4sIQII', data)
+print(ver, orig, nc)
+" "$input"
+    )
+
+    local is_tar=""
+    [[ "$input" == *.tar.aplz ]] && is_tar=" (tar archive)"
+
+    echo "APLZ File Info"
+    echo "  File        : $(basename "$input")${is_tar}"
+    echo "  Compressed  : $(human_size "$file_size")"
+    echo "  Original    : $(human_size "$orig_size")"
+    if [[ "$orig_size" != "?" && "$file_size" -gt 0 ]]; then
+        local ratio
+        ratio=$(echo "scale=1; $file_size * 100 / $orig_size" | bc -l)
+        echo "  Ratio       : ${ratio}%"
+    fi
+    echo "  Chunks      : ${num_chunks}"
+    echo "  Version     : ${version}"
+}
+
+# ─── メインディスパッチ ─────────────────────────────────────────────────────
+[[ $# -lt 1 ]] && usage
+
+case "${1}" in
+    compress|c)
+        [[ $# -lt 2 ]] && usage
+        do_compress "${2}" "${3:-}"
+        ;;
+    extract|x)
+        [[ $# -lt 2 ]] && usage
+        do_extract "${2}" "${3:-}"
+        ;;
+    info|i)
+        [[ $# -lt 2 ]] && usage
+        do_info "${2}"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: ${1}" >&2
+        usage
+        ;;
+esac
