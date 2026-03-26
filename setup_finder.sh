@@ -40,9 +40,40 @@ echo "==> Using aplz at: ${APLZ_PATH}"
 create_workflow() {
     local name="$1"
     local shell_script="$2"
+    local file_types="$3"  # NSSendFileTypes (plist XML fragment)
     local wf_dir="${SERVICES_DIR}/${name}.workflow/Contents"
 
+    # 古いワークフローを完全に削除してから再作成
+    rm -rf "${SERVICES_DIR}/${name}.workflow"
     mkdir -p "$wf_dir"
+
+    # Info.plist: macOS がサービスを認識するために必須
+    cat > "${wf_dir}/Info.plist" <<INFOPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>${name}</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>runWorkflowAsService</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSApplicationIdentifier</key>
+				<string>com.apple.finder</string>
+			</dict>
+${file_types}
+		</dict>
+	</array>
+</dict>
+</plist>
+INFOPLIST
 
     local uuid1 uuid2 uuid3
     uuid1=$(uuidgen)
@@ -288,8 +319,14 @@ COMPRESS_SCRIPT='for f in "$@"; do
     osascript -e "display notification \"圧縮完了: $(basename "$f")\" with title \"APLZ\""
 done'
 
+# NSSendFileTypes: 圧縮は全ファイル/フォルダを対象
+COMPRESS_FILE_TYPES='			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.item</string>
+			</array>'
+
 echo "==> Creating: APLZ で圧縮.workflow"
-create_workflow "APLZ で圧縮" "$COMPRESS_SCRIPT"
+create_workflow "APLZ で圧縮" "$COMPRESS_SCRIPT" "$COMPRESS_FILE_TYPES"
 
 # 解凍アクション: 選択された .aplz ファイルを解凍
 EXTRACT_SCRIPT='for f in "$@"; do
@@ -298,8 +335,14 @@ EXTRACT_SCRIPT='for f in "$@"; do
     osascript -e "display notification \"解凍完了: $(basename "$f")\" with title \"APLZ\""
 done'
 
+# NSSendFileTypes: 解凍も全ファイルを対象 (.aplz 拡張子の UTI は未登録のため)
+EXTRACT_FILE_TYPES='			<key>NSSendFileTypes</key>
+			<array>
+				<string>public.item</string>
+			</array>'
+
 echo "==> Creating: APLZ で解凍.workflow"
-create_workflow "APLZ で解凍" "$EXTRACT_SCRIPT"
+create_workflow "APLZ で解凍" "$EXTRACT_SCRIPT" "$EXTRACT_FILE_TYPES"
 
 # サービスキャッシュをリセット (変更を即座に反映)
 /System/Library/CoreServices/pbs -flush 2>/dev/null || true
