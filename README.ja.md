@@ -1,25 +1,25 @@
 # APLZ — Apple Parallel LZ
 
-**English** | [日本語](README.ja.md) | [中文](README.zh.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
+[English](README.md) | **日本語** | [中文](README.zh.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md)
 
-A high-speed lossless compression/decompression engine running on Apple Silicon GPU. Combines Metal Compute Shaders (MSL 3.0) with tANS (Asymmetric Numeral Systems) in a fully GPU-accelerated pipeline, achieving **perfect round-trip** compression.
+Apple Silicon GPU で動作する高速ロスレス圧縮/解凍エンジン。Metal Compute Shader (MSL 3.0) + tANS (Asymmetric Numeral Systems) を組み合わせた GPU パイプラインにより、圧縮・解凍の **完全 Round-trip** を実現する。
 
-## Highlights
+## ハイライト
 
-- **Zero-copy I/O**: Leverages Apple Silicon's Unified Memory Architecture (UMA). `mmap` + `newBufferWithBytesNoCopy` eliminates all CPU↔GPU data copies
-- **Parallel LZ77**: 256 threads cooperatively process each 64 KB chunk. 2-way hash (atomic_fetch_min) for fast match search
-- **Per-chunk 256 Interleaved tANS**: Dynamically builds optimal tANS tables per chunk. Each thread maintains an independent ANS state, encoding/decoding 256 bitstreams in parallel
-- **Parallel LZ77 Decode**: Non-overlapping matches are copied in parallel by 256 threads; overlapping matches (dist < len) use serial fallback. Includes barrier reduction optimization
-- **Async Double Buffering**: GCD-based batch pipeline (`dispatch_semaphore` / `dispatch_group`). Fully overlaps GPU execution with CPU I/O
-- **O(1) Streaming Memory**: Fixed memory usage independent of input size. Processes in mega-batches (32 MB) for stable operation on 5 GB+ files
-- **Perfect Round-trip**: Guarantees byte-level exact match after compress → decompress
+- **Zero-copy I/O**: Apple Silicon の Unified Memory Architecture (UMA) を活用。`mmap` + `newBufferWithBytesNoCopy` により CPU↔GPU 間のデータコピーを完全に排除
+- **並列 LZ77**: 256 スレッドが 64 KB チャンクを協調処理。2-way ハッシュ (atomic_fetch_min) で高速マッチ探索
+- **Per-chunk 256 Interleaved tANS**: チャンクごとに最適な tANS テーブルを動的構築。各スレッドが独立した ANS 状態を保持し、256 本のビットストリームを並列にエンコード/デコード
+- **並列 LZ77 デコード**: 非重複マッチは 256 スレッドで並列コピー、重複マッチ (dist < len) はシリアルフォールバック。Barrier 削減最適化付き
+- **非同期ダブルバッファリング**: GCD (`dispatch_semaphore` / `dispatch_group`) によるバッチパイプライン。GPU 実行と CPU I/O を完全にオーバーラップ
+- **O(1) ストリーミング・メモリ**: 入力サイズに依存しない固定メモリ使用量。メガバッチ (32MB) 単位で処理し、5GB+ のファイルも安定動作
+- **Perfect Round-trip**: 圧縮→解凍でバイトレベルの完全一致を保証
 
-## Architecture
+## アーキテクチャ
 
-### Compression Pipeline (`-c`)
+### 圧縮パイプライン (`-c`)
 
 ```
-mmap(input)  ← zero-copy MTLBuffer (Apple Silicon UMA)
+mmap(input)  <- zero-copy MTLBuffer (Apple Silicon UMA)
     |
     v
 ╔══════════════════════════════════════════════════════╗
@@ -34,11 +34,11 @@ mmap(input)  ← zero-copy MTLBuffer (Apple Silicon UMA)
 ║  └────────────────────────────────────────────────┘  ║
 ║  -> per-chunk histogram -> reuse buffers -> next 32MB║
 ╚══════════════════════════════════════════════════════╝
-    | per-chunk histogram (512 symbols each)
+    | チャンクごとのヒストグラム (512 シンボル)
     v
 +------------------------------------------------------+
-|  Phase B: CPU per-chunk tANS table construction      |
-|  Per chunk: Normalize → Duda's spread → Encode table |
+|  Phase B: CPU per-chunk tANS テーブル構築              |
+|  Per chunk: Normalize -> Duda's spread -> Encode table|
 +------------------------------------------------------+
     | SymInfo[512] + enc_table[1024] per chunk
     v
@@ -56,7 +56,7 @@ mmap(input)  ← zero-copy MTLBuffer (Apple Silicon UMA)
   .aplz file
 ```
 
-### Decompression Pipeline (`-d`)
+### 解凍パイプライン (`-d`)
 
 ```
 read .aplz header + chunk_offsets (seek table)
@@ -78,133 +78,134 @@ read .aplz header + chunk_offsets (seek table)
 ║    -> fwrite(buf_out) -> reuse buffers               ║
 ╚══════════════════════════════════════════════════════╝
     v
-  restored original data
+  復元データ
 ```
 
-## File Format (.aplz)
+## ファイルフォーマット (.aplz)
 
 | Offset | Size | Content |
 |---|---|---|
 | 0 | 24 B | `FileHeader` (magic "APLZ", version=3, original_size, chunk_size, num_chunks) |
 | 24 | 4 B | `n_streams` = 256 |
 | 28 | 4 B | `ans_log_l` = 10 |
-| 32 | 8×N B | `chunk_offsets[N]` (seek table) |
+| 32 | 8xN B | `chunk_offsets[N]` (seek table) |
 | ... | variable | Chunk data (per chunk: token_cnt + compact_freq + stream_sizes[256] + streams) |
 
-Per-chunk data layout:
-- `token_cnt` (4 B): number of dense tokens
-- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` pairs (4 B each) — non-zero symbols only
-- `stream_sizes[256]` (512 B): byte size of each ANS stream
-- stream data: 256 concatenated bitstreams
+Per-chunk データ構造:
 
-## Installation
+- `token_cnt` (4 B): dense token 数
+- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` pairs (4 B each) — 非ゼロシンボルのみ
+- `stream_sizes[256]` (512 B): 各 ANS ストリームのバイトサイズ
+- stream data: 256 本の連結ビットストリーム
 
-Requires macOS + Xcode Command Line Tools.
+## インストール
+
+macOS + Xcode Command Line Tools が必要。
 
 ```bash
-# Install to ~/.local/bin (optimized build with -O3 -flto)
+# ~/.local/bin にインストール (-O3 -flto 最適化ビルド)
 ./install.sh
 
-# Install to /usr/local/bin (requires sudo)
+# /usr/local/bin にインストール (sudo 必要)
 ./install.sh /usr/local
 
-# Uninstall
+# アンインストール
 ./install.sh uninstall
 ```
 
-### Finder Integration (Optional)
+### Finder 統合 (オプション)
 
 ```bash
-# Add right-click → "Compress with APLZ" / "Extract with APLZ"
+# 右クリック ->「APLZ で圧縮」「APLZ で解凍」を追加
 ./setup_finder.sh
 
-# Remove
+# 削除
 ./setup_finder.sh uninstall
 ```
 
-Supports Google Drive and cloud storage files. The service automatically processes files via `/tmp` to work around macOS sandbox restrictions.
+Google Drive やクラウドストレージ上のファイルにも対応。サービス実行時は自動的に `/tmp` 経由で処理することで、macOS サンドボックス制限を回避する。
 
-## Usage
+## 使い方
 
-### aplz command (recommended)
+### aplz コマンド (推奨)
 
 ```bash
-# Compress a file
+# ファイル圧縮
 aplz compress myfile.txt              → myfile.txt.aplz
 
-# Compress a directory (auto tar)
+# ディレクトリ圧縮 (自動 tar)
 aplz compress myproject/              → myproject.tar.aplz
 
-# Extract
+# 解凍
 aplz extract myfile.txt.aplz          → myfile.txt
 aplz extract myproject.tar.aplz       → myproject/
 
-# File info
+# ファイル情報
 aplz info myfile.txt.aplz
 ```
 
-### gpu_zip (low-level API)
+### gpu_zip (低レベル API)
 
 ```bash
 ./gpu_zip -c <input> <output.aplz> compression.metal
 ./gpu_zip -d <input.aplz> <output> compression.metal
 ```
 
-### Development Build
+### 開発用ビルド
 
 ```bash
-./build.sh        # -O2 build
-./build.sh clean   # clean artifacts
+./build.sh        # -O2 ビルド
+./build.sh clean   # 成果物削除
 ```
 
-## Performance (Apple M4)
+## パフォーマンス (Apple M4)
 
-### Compression
+### 圧縮
 
-| Data | Input | Output | Ratio | Throughput |
+| データ | 入力 | 出力 | 圧縮率 | スループット |
 |---|---|---|---|---|
-| Text (repeating pattern) | 1 MB | 31 KB | 3.0% | 50 MB/s |
-| Text (large) | 100 MB | 3.0 MB | 3.0% | 251 MB/s |
-| Random binary | 10 MB | 10.6 MB | 106% | 121 MB/s |
+| テキスト (繰り返しパターン) | 1 MB | 31 KB | 3.0% | 50 MB/s |
+| テキスト (大規模) | 100 MB | 3.0 MB | 3.0% | 251 MB/s |
+| ランダムバイナリ | 10 MB | 10.6 MB | 106% | 121 MB/s |
 
-### Decompression
+### 解凍
 
-| Data | Speed | Notes |
+| データ | 速度 | 備考 |
 |---|---|---|
-| Text (1 MB) | 246 MB/s | 1 mega-batch, minimal pipeline overhead |
-| Text (100 MB) | 1.4 GB/s | 4 mega-batches, full pipeline overlap |
-| Random (10 MB) | 246 MB/s | 1 mega-batch, mostly literals |
+| テキスト (1 MB) | 246 MB/s | 1 mega-batch、パイプラインオーバーヘッド最小 |
+| テキスト (100 MB) | 1.4 GB/s | 4 mega-batches、フルパイプラインオーバーラップ |
+| ランダム (10 MB) | 246 MB/s | 1 mega-batch、ほぼリテラル |
 
-> Random data is incompressible so output slightly exceeds input (tANS/distance field overhead).
-> Memory usage is constant (~512 MB) regardless of input size thanks to mega-batch streaming.
+> ランダムデータは非圧縮のため、出力が入力をわずかに超える (tANS/distance フィールドのオーバーヘッド)。
+> メガバッチストリーミングにより、入力サイズに関係なくメモリ使用量は一定 (~512 MB)。
 
-## Source Files
+## ソースファイル構成
 
-| File | Role |
+| ファイル | 役割 |
 |---|---|
-| `APLZ.h` | Shared header (structs & constants for CPU and GPU) |
-| `compression.metal` | GPU kernels (MSL 3.0): compress_chunk, tans_encode, tans_decode, lz77_decode |
-| `main.mm` | Host driver (Objective-C++): O(1) streaming mega-batch + async double-buffered pipelines |
-| `aplz` | User-facing CLI wrapper (Bash): file/directory support, tar integration |
-| `install.sh` | Installer: optimized build (-O3 -flto) + system-wide deployment |
-| `setup_finder.sh` | macOS Finder Quick Action generator (right-click compress/extract) |
-| `build.sh` | Development build script |
+| `APLZ.h` | 共有ヘッダ (CPU/GPU 共通の構造体・定数) |
+| `compression.metal` | GPU カーネル (MSL 3.0): compress_chunk, tans_encode, tans_decode, lz77_decode |
+| `main.mm` | ホストドライバ (Objective-C++): O(1) ストリーミング・メガバッチ + 非同期ダブルバッファパイプライン |
+| `aplz` | ユーザー向け CLI ラッパー (Bash): ファイル/ディレクトリ対応、tar 統合 |
+| `install.sh` | インストーラ: 最適化ビルド (-O3 -flto) + システムワイドデプロイ |
+| `setup_finder.sh` | macOS Finder Quick Action 生成 (右クリック圧縮/解凍) |
+| `build.sh` | 開発用ビルドスクリプト |
 
-## Technical Details
+## 技術詳細
 
 - **LZ77**: 3-gram hash, 2-way hash table (atomic_fetch_min), max match 255, min match 3, distance up to 65534
-- **Per-chunk tANS (v3)**: Dynamically builds optimal tANS tables per 64 KB chunk. 512 symbols (256 literals + 256 match lengths), L=1024, Duda's fast spread. Threadgroup cooperative loading for fast per-chunk table access on GPU
+- **Per-chunk tANS (v3)**: 各 64KB チャンクごとに最適な tANS テーブルを動的構築。512 symbols (256 literals + 256 match lengths), L=1024, Duda's fast spread。Threadgroup cooperative loading で per-chunk テーブルを高速ロード
 - **ANS Encoding**: Forward encode with renormalization, sentinel bit for bitstream end detection
 - **ANS Decoding**: Reverse playback from final state, sentinel via `clz()`, O(1) decode table lookup
-- **Compact Frequency Serialization**: Stores only non-zero entries per chunk (`n_nonzero + [sym_id, freq]` pairs), minimizing file size overhead
+- **Compact Frequency Serialization**: Per-chunk 頻度テーブルを非ゼロエントリのみ保存 (`n_nonzero + [sym_id, freq]` pairs) でファイルサイズオーバーヘッドを最小化
 - **LZ77 Parallel Decode**: Hybrid approach — serial fallback for token count > 4096, parallel cooperative copy with barrier reduction for dense match streams
 - **Async Double Buffering**: GCD-based batch pipeline (32 chunks/batch, 2 slots). `dispatch_semaphore` for slot exclusion, `addCompletedHandler` + serial `dispatch_queue` for ordered async writes
 - **O(1) Streaming Memory**: Mega-batch architecture (512 chunks = 32MB per batch). Buffers are reused across mega-batches. Fixed ~512 MB memory regardless of input size.
 
-## Known Limitations
+## 既知の制約
 
-- **BS_CAP = 512 B**: 1 stream max output is 512 bytes. Highly incompressible data may truncate bits.
-- **Chunk size fixed at 64 KB**: Tunable but requires rebuild.
+- **BS_CAP = 512 B**: 1 ストリームの最大出力は 512 バイト。高度に非圧縮なデータではビットが切り捨てられる可能性がある。
+- **チャンクサイズ固定 64 KB**: 変更可能だが再ビルドが必要。
 
 ## License
 

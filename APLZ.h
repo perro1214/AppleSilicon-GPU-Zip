@@ -3,15 +3,15 @@
 // CPU (main.mm) と GPU (compression.metal) の両方で使用する
 // 構造体・定数の定義をここに集約する。
 //
-// ファイルフォーマット概要:
+// ファイルフォーマット概要 (v3):
 //   FileHeader (24 B)
 //   n_streams  (4 B)   = 256
 //   ans_log_l  (4 B)   = 10
-//   SymInfo[512] (2048 B)
 //   chunk_offsets[num_chunks] (8 B 各, seek table)
 //   --- チャンクデータ (num_chunks 個) ---
 //   Per chunk:
 //     token_cnt (4 B)                      ← dense token 数 (tANS デコードに必要)
+//     compact_freq: n_nonzero(2B) + [sym_id(2B), freq(2B)]... ← per-chunk 頻度テーブル
 //     uint16_t stream_sizes[256]   (512 B)
 //     stream_0_data | stream_1_data | ... | stream_255_data
 
@@ -63,7 +63,7 @@ static_assert(sizeof(SymInfo) == 4, "SymInfo size mismatch");
 #pragma pack(push, 1)
 struct FileHeader {
     uint8_t  magic[4];       // "APLZ" (マジックバイト)
-    uint32_t version;        // 2 (APLZ_MAGIC_V2)
+    uint32_t version;        // 3 (APLZ_MAGIC_V3)
     uint64_t original_size;  // 元ファイルサイズ (バイト)
     uint32_t chunk_size;     // チャンクサイズ = APLZ_CHUNK_SIZE
     uint32_t num_chunks;     // チャンク数 = ceil(original_size / chunk_size)
