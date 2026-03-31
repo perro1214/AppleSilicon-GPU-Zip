@@ -119,13 +119,90 @@ kernel void compress_chunk(
     }
     threadgroup_barrier(mem_flags::mem_device);
 
+    // ── コンパクション並列化 (parallel prefix-sum) ─────────────────────────
+    // アルゴリズム:
+    //   Step 1 (tid==0): sparse を1回走査し、各スレッドの担当開始位置 tg_starts[t] を決定。
+    //                    担当区間は compact トークン数が均等になるよう割り当てる。
+    //   Step 2 (全スレッド): 各スレッドが [tg_starts[tid], tg_starts[tid+1]) を走査し、
+    //                         compact トークンを sparse バッファの専用スロットに書く。
+    //                         (sparse はこの時点で読み終わっており安全に再利用可能)
+    //   Step 3 (tid==0): exclusive prefix-sum で書き込みオフセットを計算。
+    //   Step 4 (全スレッド): sparse 一時領域 -> compact 最終バッファへコピー。
+    //                         sparse と compact は別バッファなので競合なし。
+    threadgroup uint tg_starts[256];    // 各 tid の sparse 走査開始インデックス
+    threadgroup uint tg_local_cnt[256]; // 各 tid が生成するトークン数
+    threadgroup uint tg_offsets[257];   // exclusive prefix-sum (size tg_size+1)
+
+    // Step 1
     if (tid == 0u) {
-        uint j = 0u, i = 0u;
+        uint total_tok = 0u;
+        uint i = 0u;
         while (i < clen) {
-            compact[j++] = sparse[i];
+            total_tok++;
             i += sparse[i].is_match ? uint(sparse[i].val) : 1u;
         }
-        compact_cnt[gid] = j;
+        uint toks_per = (total_tok + tg_size - 1u) / tg_size;
+
+        uint tok_count = 0u;
+        uint cur_tid = 0u;
+        tg_starts[0u] = 0u;
+        i = 0u;
+        while (i < clen) {
+            tok_count++;
+            uint step = sparse[i].is_match ? uint(sparse[i].val) : 1u;
+            i += step;
+            if (tok_count % toks_per == 0u && cur_tid + 1u < tg_size) {
+                cur_tid++;
+                tg_starts[cur_tid] = i;
+            }
+        }
+        for (uint t = cur_tid + 1u; t < tg_size; t++)
+            tg_starts[t] = clen;
+        compact_cnt[gid] = total_tok;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: 担当区間をコンパクション。
+    // 一時書き込み先: compact[tid * max_per_thread + k]。
+    // sparse と compact は別バッファなので sparse の読み取りに干渉しない。
+    // tg_offsets[tid] <= tid * max_per_thread が常に成立するため、
+    // Step 4 の前方コピーでスレッド間のデータ競合も起きない（後述）。
+    uint my_start = tg_starts[tid];
+    uint my_end   = (tid + 1u < tg_size) ? tg_starts[tid + 1u] : clen;
+    const uint max_per_thread = (CHUNK_SIZE + tg_size - 1u) / tg_size;
+    device LzToken* my_tmp = compact + tid * max_per_thread;
+
+    uint local_cnt = 0u;
+    {
+        uint i = my_start;
+        while (i < my_end && local_cnt < max_per_thread) {
+            LzToken tok = sparse[i];
+            my_tmp[local_cnt++] = tok;
+            i += tok.is_match ? uint(tok.val) : 1u;
+        }
+    }
+    tg_local_cnt[tid] = local_cnt;
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Step 3: exclusive prefix-sum
+    if (tid == 0u) {
+        tg_offsets[0u] = 0u;
+        for (uint t = 0u; t < tg_size; t++)
+            tg_offsets[t + 1u] = tg_offsets[t] + tg_local_cnt[t];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: tid==0 が compact 一時領域を前から順に最終位置へ詰める。
+    // 複数スレッドが同バッファを同時に読み書きすると競合するため tid==0 でシリアル実施。
+    if (tid == 0u) {
+        uint total_tok = tg_offsets[tg_size];
+        uint dst = 0u;
+        for (uint t = 0u; t < tg_size && dst < total_tok; t++) {
+            uint src = t * max_per_thread;
+            uint cnt = tg_local_cnt[t];
+            for (uint k = 0u; k < cnt; k++)
+                compact[dst++] = compact[src + k];
+        }
     }
 }
 
@@ -293,17 +370,24 @@ kernel void tans_decode(
         if (e.symbol >= 256u) {
             tok.is_match = 1;
             tok.val = uint16_t(e.symbol - 256u);
-            uint dist = 0u;
-            for (int b = 0; b < 16; b++) {
-                if (bit_pos < 0) {
-                    atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
-                    return;
-                }
-                uint bpi = uint(bit_pos);
-                dist = (dist << 1u) | ((uint(my_in[bpi >> 3u]) >> (bpi & 7u)) & 1u);
-                bit_pos--;
+            // 距離フィールド 16 ビットをバッチ取得。
+            // エンコード: bit_buf |= (dist << bit_cnt) → dist LSB が小ビット位置に書かれる。
+            // デコード逆走: bit_pos は最後に書かれた dist MSB 位置を指す。
+            // [bit_pos-15 .. bit_pos] の 16 ビットを取り出すと raw16 = dist そのまま (反転不要)。
+            if (bit_pos < 15) {
+                atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
+                return;
             }
-            tok.dist = uint16_t(dist);
+            uint lo16 = uint(bit_pos) - 15u;    // dist の LSB 側ビット位置
+            uint byte_lo = lo16 >> 3u;
+            uint bit_lo  = lo16 & 7u;
+            // 最大 3 バイトのウィンドウで 16 ビットを取り出す
+            uint w = uint(my_in[byte_lo]);
+            if (byte_lo + 1u < data_bytes) w |= uint(my_in[byte_lo + 1u]) << 8u;
+            if (byte_lo + 2u < data_bytes) w |= uint(my_in[byte_lo + 2u]) << 16u;
+            uint raw16 = (w >> bit_lo) & 0xFFFFu;
+            tok.dist = uint16_t(raw16);
+            bit_pos -= 16;
         } else {
             tok.is_match = 0;
             tok.val = uint16_t(e.symbol);
@@ -312,14 +396,22 @@ kernel void tans_decode(
 
         uint nb = uint(e.num_bits);
         uint bits = 0u;
-        for (uint b = 0u; b < nb; b++) {
-            if (bit_pos < 0) {
+        if (nb > 0u) {
+            // ANS num_bits は最大 ANS_LOG_L = 10 ビット。
+            // エンコード: bit_buf |= (state_lower_bits << bit_cnt) → LSB が小ビット位置
+            // [bit_pos-nb+1 .. bit_pos] を取り出すと raw_nb = state_lower_bits そのまま (反転不要)
+            if (bit_pos < int(nb) - 1) {
                 atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
                 return;
             }
-            uint bpi = uint(bit_pos);
-            bits = (bits << 1u) | ((uint(my_in[bpi >> 3u]) >> (bpi & 7u)) & 1u);
-            bit_pos--;
+            uint lo_nb = uint(bit_pos) - nb + 1u;
+            uint byte_nb = lo_nb >> 3u;
+            uint bit_nb  = lo_nb & 7u;
+            uint w2 = uint(my_in[byte_nb]);
+            if (byte_nb + 1u < data_bytes) w2 |= uint(my_in[byte_nb + 1u]) << 8u;
+            if (byte_nb + 2u < data_bytes) w2 |= uint(my_in[byte_nb + 2u]) << 16u;
+            bits = (w2 >> bit_nb) & ((1u << nb) - 1u);
+            bit_pos -= int(nb);
         }
         state = uint(e.new_base) + bits;
 

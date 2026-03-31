@@ -181,14 +181,33 @@ static void write_compact_freq(FILE* f, const SymInfo* si) {
     }
 }
 
-static void read_compact_freq(FILE* f, SymInfo* si) {
+static bool read_compact_freq(FILE* f, SymInfo* si) {
     memset(si, 0, N_SYMBOLS * sizeof(SymInfo));
     uint16_t n_nz;
-    fread(&n_nz, 2, 1, f);
+    if (fread(&n_nz, 2, 1, f) != 1) {
+        fprintf(stderr, "[APLZ] read_compact_freq: failed to read n_nonzero\n");
+        return false;
+    }
+    if (n_nz > N_SYMBOLS) {
+        fprintf(stderr, "[APLZ] read_compact_freq: n_nonzero %u exceeds N_SYMBOLS %u\n",
+                (unsigned)n_nz, (unsigned)N_SYMBOLS);
+        return false;
+    }
     for (uint16_t i = 0; i < n_nz; i++) {
         uint16_t sym, freq;
-        fread(&sym, 2, 1, f);
-        fread(&freq, 2, 1, f);
+        if (fread(&sym, 2, 1, f) != 1) {
+            fprintf(stderr, "[APLZ] read_compact_freq: failed to read symbol at entry %u\n", (unsigned)i);
+            return false;
+        }
+        if (sym >= N_SYMBOLS) {
+            fprintf(stderr, "[APLZ] read_compact_freq: symbol %u out of range (>= %u)\n",
+                    (unsigned)sym, (unsigned)N_SYMBOLS);
+            return false;
+        }
+        if (fread(&freq, 2, 1, f) != 1) {
+            fprintf(stderr, "[APLZ] read_compact_freq: failed to read freq at entry %u\n", (unsigned)i);
+            return false;
+        }
         si[sym].freq = freq;
     }
     // cum_freq を再計算
@@ -197,18 +216,20 @@ static void read_compact_freq(FILE* f, SymInfo* si) {
         si[i].cum_freq = cum;
         cum += si[i].freq;
     }
+    return true;
 }
 
 // ─── GPU Pass1 dispatch ヘルパー ──────────────────────────────────────────────
-static void dispatch_pass1(id<MTLCommandQueue> cq,
-                           id<MTLComputePipelineState> pso,
-                           id<MTLBuffer> buf_in,
-                           id<MTLBuffer> buf_sparse,
-                           id<MTLBuffer> buf_compact,
-                           id<MTLBuffer> buf_cnt,
-                           uint32_t mc_start,
-                           uint32_t mc_count,
-                           size_t   file_size) {
+// dispatch_semaphore_t を返す。呼び出し元は必要になったタイミングで wait すること。
+static dispatch_semaphore_t dispatch_pass1(id<MTLCommandQueue> cq,
+                                           id<MTLComputePipelineState> pso,
+                                           id<MTLBuffer> buf_in,
+                                           id<MTLBuffer> buf_sparse,
+                                           id<MTLBuffer> buf_compact,
+                                           id<MTLBuffer> buf_cnt,
+                                           uint32_t mc_start,
+                                           uint32_t mc_count,
+                                           size_t   file_size) {
     size_t in_offset = (size_t)mc_start * CHUNK_SIZE;
     uint32_t mb_bytes = (uint32_t)std::min(
         (uint64_t)mc_count * CHUNK_SIZE,
@@ -225,14 +246,18 @@ static void dispatch_pass1(id<MTLCommandQueue> cq,
     [enc dispatchThreadgroups:MTLSizeMake(mc_count, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
     [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
 
-    if (cb.error) {
-        fprintf(stderr, "[APLZ] Pass 1 error: %s\n",
-                cb.error.localizedDescription.UTF8String);
-        exit(EXIT_FAILURE);
-    }
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.error) {
+            fprintf(stderr, "[APLZ] Pass 1 error: %s\n",
+                    completed.error.localizedDescription.UTF8String);
+            exit(EXIT_FAILURE);
+        }
+        dispatch_semaphore_signal(sem);
+    }];
+    [cb commit];
+    return sem;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -372,9 +397,13 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         uint32_t mc_start = mb * mb_chunks;
         uint32_t mc_count = std::min(mb_chunks, num_chunks - mc_start);
 
-        // ── GPU Pass1 ────────────────────────────────────────────────────
-        dispatch_pass1(cq, pso1, buf_in, buf_sparse, buf_compact, buf_cnt,
-                        mc_start, mc_count, file_size);
+        // ── GPU Pass1 (非同期ディスパッチ) ────────────────────────────────
+        dispatch_semaphore_t pass1_sem = dispatch_pass1(
+            cq, pso1, buf_in, buf_sparse, buf_compact, buf_cnt,
+            mc_start, mc_count, file_size);
+
+        // Pass1 完了を待機してから CPU でバッファを参照
+        dispatch_semaphore_wait(pass1_sem, DISPATCH_TIME_FOREVER);
 
         const LzToken*  compact_ptr = (const LzToken*)buf_compact.contents;
         const uint32_t* cnt_ptr     = (const uint32_t*)buf_cnt.contents;
@@ -477,13 +506,16 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                         }
                         fwrite(ssz, 2, 256, fout);
 
-                        std::vector<uint8_t> payload;
-                        payload.reserve(payload_size);
+                        std::vector<uint8_t> payload(payload_size);
+                        size_t off = 0;
                         for (uint32_t s = 0; s < 256; s++) {
-                            const uint8_t* sdata = bs + ((size_t)lc * 256 + s) * BS_CAP;
-                            payload.insert(payload.end(), sdata, sdata + ssz[s]);
+                            if (ssz[s] > 0) {
+                                const uint8_t* sdata = bs + ((size_t)lc * 256 + s) * BS_CAP;
+                                memcpy(payload.data() + off, sdata, ssz[s]);
+                                off += ssz[s];
+                            }
                         }
-                        fwrite(payload.data(), 1, payload.size(), fout);
+                        fwrite(payload.data(), 1, payload_size, fout);
                     }
 
                     dispatch_semaphore_signal(buf_sem);
@@ -554,8 +586,10 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
     }
 
     uint32_t ns, al;
-    fread(&ns, 4, 1, f);
-    fread(&al, 4, 1, f);
+    if (fread(&ns, 4, 1, f) != 1 || fread(&al, 4, 1, f) != 1) {
+        fprintf(stderr, "[APLZ] Failed to read n_streams/ans_log_l.\n");
+        fclose(f); return EXIT_FAILURE;
+    }
 
     // v3: グローバル SymInfo はない。v2 互換のためバージョンチェック。
     if (hdr.version == 2) {
@@ -577,7 +611,34 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
     }
 
     std::vector<uint64_t> chunk_offsets(num_chunks);
-    fread(chunk_offsets.data(), 8, num_chunks, f);
+    if (fread(chunk_offsets.data(), 8, num_chunks, f) != num_chunks) {
+        fprintf(stderr, "[APLZ] Failed to read chunk_offsets table.\n");
+        fclose(f); return EXIT_FAILURE;
+    }
+
+    // chunk_offsets バリデーション
+    {
+        // ファイルサイズ取得
+        long saved_pos = ftell(f);
+        if (fseek(f, 0, SEEK_END) != 0) { perror("fseek"); fclose(f); return EXIT_FAILURE; }
+        uint64_t file_sz = (uint64_t)ftell(f);
+        if (fseek(f, saved_pos, SEEK_SET) != 0) { perror("fseek"); fclose(f); return EXIT_FAILURE; }
+
+        for (uint32_t ci = 0; ci < num_chunks; ci++) {
+            if (chunk_offsets[ci] >= file_sz) {
+                fprintf(stderr, "[APLZ] chunk_offsets[%u]=%llu is out of file bounds (%llu).\n",
+                        ci, (unsigned long long)chunk_offsets[ci], (unsigned long long)file_sz);
+                fclose(f); return EXIT_FAILURE;
+            }
+            if (ci > 0 && chunk_offsets[ci] <= chunk_offsets[ci - 1]) {
+                fprintf(stderr, "[APLZ] chunk_offsets not monotonically increasing at index %u "
+                        "(%llu <= %llu).\n",
+                        ci, (unsigned long long)chunk_offsets[ci],
+                        (unsigned long long)chunk_offsets[ci - 1]);
+                fclose(f); return EXIT_FAILURE;
+            }
+        }
+    }
 
     printf("[APLZ] Decompress: %s (v%u)\n", in_path, hdr.version);
     printf("[APLZ] Original  : %llu bytes (%.2f MB)\n",
@@ -682,12 +743,22 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
             for (uint32_t lc = 0; lc < lc_count; lc++) {
                 uint32_t gc = gc_start + lc;
-                fseek(f, (long)chunk_offsets[gc], SEEK_SET);
-                fread(&tcnt_data[lc], 4, 1, f);
+                if (fseek(f, (long)chunk_offsets[gc], SEEK_SET) != 0) {
+                    perror("[APLZ] fseek chunk_offsets");
+                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                }
+                if (fread(&tcnt_data[lc], 4, 1, f) != 1) {
+                    fprintf(stderr, "[APLZ] Failed to read token_cnt at chunk %u\n", gc);
+                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                }
 
                 // per-chunk 頻度テーブル読み込み + デコードテーブル構築
                 if (hdr.version >= 3) {
-                    read_compact_freq(f, chunk_si);
+                    if (!read_compact_freq(f, chunk_si)) {
+                        fprintf(stderr, "[APLZ] Corrupt compact_freq at chunk %u\n", gc);
+                        fclose(f); fclose(fout); unlink(out_path);
+                        return EXIT_FAILURE;
+                    }
                 } else {
                     // v2 互換: グローバルテーブルは既に読み飛ばし済み
                     // (v2ファイルはこのコードパスに来ないはず)
@@ -697,11 +768,17 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                 build_decode_table(chunk_si, spread, dec_data + (size_t)lc * ANS_L);
 
                 uint16_t ssz[256];
-                fread(ssz, 2, 256, f);
+                if (fread(ssz, 2, 256, f) != 256) {
+                    fprintf(stderr, "[APLZ] Failed to read stream sizes at chunk %u\n", gc);
+                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                }
                 size_t stream_total = 0;
                 for (uint32_t s = 0; s < 256; s++) stream_total += ssz[s];
                 std::vector<uint8_t> stream_buf(stream_total);
-                fread(stream_buf.data(), 1, stream_total, f);
+                if (stream_total > 0 && fread(stream_buf.data(), 1, stream_total, f) != stream_total) {
+                    fprintf(stderr, "[APLZ] Failed to read stream data at chunk %u\n", gc);
+                    fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+                }
                 const uint8_t* src = stream_buf.data();
                 for (uint32_t s = 0; s < 256; s++) {
                     bsz_data[(size_t)lc * 256 + s] = (uint32_t)ssz[s];
@@ -790,7 +867,10 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
         size_t mb_bytes = std::min(
             (size_t)mc_count * CHUNK_SIZE,
             (size_t)(original_size - (uint64_t)mc_start * CHUNK_SIZE));
-        fwrite(buf_out.contents, 1, mb_bytes, fout);
+        if (fwrite(buf_out.contents, 1, mb_bytes, fout) != mb_bytes) {
+            perror("[APLZ] fwrite output");
+            fclose(f); fclose(fout); unlink(out_path); return EXIT_FAILURE;
+        }
     }
 
     fclose(f);
