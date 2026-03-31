@@ -15,7 +15,7 @@ constant uint HASH_BITS  = 11u;
 constant uint HASH_SIZE  = 1u << HASH_BITS;
 constant uint MAX_MATCH  = 255u;
 constant uint MIN_MATCH  = 3u;
-constant uint SIMD_W     = 32u;
+constant uint SERIAL_FALLBACK_TOKEN_THRESHOLD = 8192u;
 
 // ─── tANS 定数 ─────────────────────────────────────────────────────────────────
 constant uint ANS_LOG_L  = 10u;
@@ -143,12 +143,9 @@ kernel void tans_encode(
     device const uint16_t*  enc_arr    [[ buffer(3) ]],
     device       uint8_t*   bs_out     [[ buffer(4) ]],
     device       uint32_t*  bs_sizes   [[ buffer(5) ]],
-    device       uint32_t*  chunk_comp [[ buffer(6) ]],
 
     uint tid     [[ thread_index_in_threadgroup ]],
     uint tg_size [[ threads_per_threadgroup ]],
-    uint sg_id   [[ simdgroup_index_in_threadgroup ]],
-    uint sg_lid  [[ thread_index_in_simdgroup ]],
     uint gid     [[ threadgroup_position_in_grid ]]
 ) {
     // ── Per-chunk テーブルを threadgroup メモリに協調ロード ────────────────
@@ -167,9 +164,6 @@ kernel void tans_encode(
     // ── エンコード ────────────────────────────────────────────────────────
     const uint n_tok = token_cnt[gid];
     device const LzToken* ct = tokens + (uint64_t)gid * CHUNK_SIZE;
-    const uint n_sg = tg_size / SIMD_W;
-    threadgroup uint sg_sums[8];
-
     uint state   = ANS_L;
     uint bit_buf = 0u;
     uint bit_cnt = 0u;
@@ -223,22 +217,7 @@ kernel void tans_encode(
         my_out[bp++] = uint8_t((state >> 8u) & 0xFFu);
     }
 
-    // SIMD prefix sum
-    uint my_bytes = bp;
-    uint sg_off   = simd_prefix_exclusive_sum(my_bytes);
-    uint sg_total = simd_sum(my_bytes);
-
-    bs_sizes[gid * tg_size + tid] = my_bytes;
-
-    if (sg_lid == 0u) sg_sums[sg_id] = sg_total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0u) {
-        uint total = 0u;
-        for (uint s = 0u; s < n_sg; ++s) total += sg_sums[s];
-        chunk_comp[gid] = total;
-    }
-    (void)sg_off;
+    bs_sizes[gid * tg_size + tid] = bp;
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -354,8 +333,6 @@ kernel void tans_decode(
 // ════════════════════════════════════════════════════════════════════════════════
 // Kernel 4: lz77_decode — LZ77 展開 (変更なし)
 // ════════════════════════════════════════════════════════════════════════════════
-constant uint MAX_PAR_TOKENS = CHUNK_SIZE;
-
 kernel void lz77_decode(
     device const LzToken*   tokens      [[ buffer(0) ]],
     device const uint32_t*  token_cnt   [[ buffer(1) ]],
@@ -379,42 +356,65 @@ kernel void lz77_decode(
     device const LzToken* ct = tokens + (uint64_t)gid * CHUNK_SIZE;
     device uint8_t* out = out_data + base;
 
-    if (n_tok > MAX_PAR_TOKENS) {
-        if (tid == 0u) {
-            uint pos = 0u;
+    threadgroup uint tg_serial_mode;
+    threadgroup uint tg_invalid;
+
+    tg_serial_mode = 0u;
+    tg_invalid = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        uint pos = 0u;
+        uint match_cnt = 0u;
+        for (uint i = 0u; i < n_tok && pos < clen; i++) {
+            if (ct[i].is_match) {
+                uint len = uint(ct[i].val), dist = uint(ct[i].dist);
+                if (len == 0u || dist == 0u || dist > pos || pos + len > clen) {
+                    tg_invalid = 1u;
+                    break;
+                }
+                match_cnt++;
+                pos += len;
+            } else {
+                pos += 1u;
+            }
+        }
+        if (tg_invalid == 0u && pos != clen)
+            tg_invalid = 1u;
+        if (tg_invalid != 0u) {
+            atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
+        } else if (n_tok > SERIAL_FALLBACK_TOKEN_THRESHOLD &&
+                   match_cnt * 16u <= n_tok) {
+            tg_serial_mode = 1u;
+            pos = 0u;
             for (uint i = 0u; i < n_tok && pos < clen; i++) {
                 if (ct[i].is_match) {
                     uint len = uint(ct[i].val), dist = uint(ct[i].dist);
-                    if (len == 0u || dist == 0u || dist > pos || pos + len > clen) {
-                        atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
-                        return;
-                    }
                     for (uint j = 0u; j < len && pos < clen; j++) {
-                        out[pos] = out[pos - dist]; pos++;
+                        out[pos] = out[pos - dist];
+                        pos++;
                     }
                 } else {
                     out[pos++] = uint8_t(ct[i].val);
                 }
             }
-            if (pos != clen)
+            if (pos != clen) {
+                tg_invalid = 1u;
                 atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
-        }
-        return;
-    }
-
-    {
-        uint pos = 0u;
-        for (uint i = 0u; i < n_tok; i++) {
-            if (!ct[i].is_match) {
-                if (tid == 0u && pos < clen)
+            }
+        } else {
+            pos = 0u;
+            for (uint i = 0u; i < n_tok; i++) {
+                if (!ct[i].is_match)
                     out[pos] = uint8_t(ct[i].val);
-                pos += 1u;
-            } else {
-                pos += uint(ct[i].val);
+                pos += ct[i].is_match ? uint(ct[i].val) : 1u;
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_device);
+
+    if (tg_invalid != 0u || tg_serial_mode != 0u)
+        return;
 
     {
         uint pos = 0u;
@@ -450,7 +450,9 @@ kernel void lz77_decode(
             max_mw = max(max_mw, off + len);
             pos += len;
         }
-        if (tid == 0u && pos != clen)
-            atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
+        if (tid == 0u) {
+            if (pos != clen)
+                atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
+        }
     }
 }

@@ -318,7 +318,7 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     // Per-batch テーブルバッファ (ダブルバッファ)
     // sym_arr: SymInfo[BATCH_CHUNKS][N_SYMBOLS], enc_arr: uint16_t[BATCH_CHUNKS][ANS_L]
     id<MTLBuffer> slot_sym[N_BUFS], slot_enc[N_BUFS];
-    id<MTLBuffer> slot_bs[N_BUFS], slot_bsz[N_BUFS], slot_ccomp[N_BUFS];
+    id<MTLBuffer> slot_bs[N_BUFS], slot_bsz[N_BUFS];
     for (uint32_t s = 0; s < N_BUFS; s++) {
         slot_sym[s]   = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * N_SYMBOLS * sizeof(SymInfo)
                                           options:MTLResourceStorageModeShared];
@@ -328,8 +328,6 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                                          options:MTLResourceStorageModeShared];
         slot_bsz[s]   = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * N_STREAMS * sizeof(uint32_t)
                                           options:MTLResourceStorageModeShared];
-        slot_ccomp[s]  = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * sizeof(uint32_t)
-                                           options:MTLResourceStorageModeShared];
     }
 
     CFTimeInterval t_total_start = CACurrentMediaTime();
@@ -438,7 +436,6 @@ static int compress(const char* in_path, const char* out_path, const char* shade
             [enc2 setBuffer:slot_enc[sl]   offset:0 atIndex:3];
             [enc2 setBuffer:slot_bs[sl]    offset:0 atIndex:4];
             [enc2 setBuffer:slot_bsz[sl]   offset:0 atIndex:5];
-            [enc2 setBuffer:slot_ccomp[sl] offset:0 atIndex:6];
             [enc2 dispatchThreadgroups:MTLSizeMake(lc_count, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
             [enc2 endEncoding];
