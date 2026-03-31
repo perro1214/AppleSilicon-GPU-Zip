@@ -91,6 +91,7 @@ tar_is_safe() {
 do_compress() {
     local input="$1"
     local output="${2:-}"
+    local in_size=0
 
     if [[ ! -e "$input" ]]; then
         echo "Error: '$input' not found." >&2
@@ -109,6 +110,7 @@ do_compress() {
 
         local tar_size
         tar_size=$(stat -f%z "$TMP_TAR" 2>/dev/null || stat -c%s "$TMP_TAR" 2>/dev/null)
+        in_size="$tar_size"
         echo "    tar size: $(human_size "$tar_size")"
 
         echo "==> Compressing: tar → ${output}"
@@ -121,18 +123,14 @@ do_compress() {
 
         echo "==> Compressing: ${input} → ${output}"
         "$GPU_ZIP" -c "$input" "$output" "$SHADER"
-    fi
-
-    local in_size out_size
-    if [[ -d "$input" ]]; then
-        in_size=$(stat -f%z "$TMP_TAR" 2>/dev/null || echo 0)
-    else
         in_size=$(stat -f%z "$input" 2>/dev/null || stat -c%s "$input" 2>/dev/null)
     fi
+
+    local out_size
     out_size=$(stat -f%z "$output" 2>/dev/null || stat -c%s "$output" 2>/dev/null)
 
     echo ""
-    echo "Done: $(human_size "$out_size")  ($(basename "$output"))"
+    echo "Done: $(human_size "$in_size") → $(human_size "$out_size")  ($(basename "$output"))"
 }
 
 # ─── extract サブコマンド ────────────────────────────────────────────────────

@@ -253,6 +253,7 @@ kernel void tans_decode(
     device const DecodeEntry*  dec_arr     [[ buffer(2) ]],
     device       LzToken*      out_tokens  [[ buffer(3) ]],
     device const uint32_t*     token_cnt   [[ buffer(4) ]],
+    device       atomic_uint*  ans_err     [[ buffer(5) ]],
 
     uint tid     [[ thread_index_in_threadgroup ]],
     uint tg_size [[ threads_per_threadgroup ]],
@@ -266,6 +267,10 @@ kernel void tans_decode(
         tg_dec[i] = my_dec[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    if (tid == 0u)
+        atomic_store_explicit(&ans_err[gid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // ── デコード ──────────────────────────────────────────────────────────
     const uint n_tok = token_cnt[gid];
     uint my_count = (tid < n_tok) ? ((n_tok - 1u - tid) / tg_size + 1u) : 0u;
@@ -274,9 +279,17 @@ kernel void tans_decode(
     uint stream_idx = gid * tg_size + tid;
     uint bp = bs_sizes[stream_idx];
     device const uint8_t* my_in = bs_in + (uint64_t)stream_idx * BS_CAP;
+    if (bp < 2u || bp > BS_CAP) {
+        atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
+        return;
+    }
 
     uint state = uint(my_in[bp - 2u]) | (uint(my_in[bp - 1u]) << 8u);
     uint data_bytes = bp - 2u;
+    if (state < ANS_L || state >= 2u * ANS_L) {
+        atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
+        return;
+    }
 
     int bit_pos = -1;
     if (data_bytes > 0u) {
@@ -288,6 +301,10 @@ kernel void tans_decode(
     device LzToken* chunk_out = out_tokens + (uint64_t)gid * CHUNK_SIZE;
 
     for (int t = int(my_count) - 1; t >= 0; t--) {
+        if (state < ANS_L || state >= 2u * ANS_L) {
+            atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
+            return;
+        }
         uint idx = state - ANS_L;
         DecodeEntry e = tg_dec[idx];
 
@@ -299,6 +316,10 @@ kernel void tans_decode(
             tok.val = uint16_t(e.symbol - 256u);
             uint dist = 0u;
             for (int b = 0; b < 16; b++) {
+                if (bit_pos < 0) {
+                    atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
+                    return;
+                }
                 uint bpi = uint(bit_pos);
                 dist = (dist << 1u) | ((uint(my_in[bpi >> 3u]) >> (bpi & 7u)) & 1u);
                 bit_pos--;
@@ -313,6 +334,10 @@ kernel void tans_decode(
         uint nb = uint(e.num_bits);
         uint bits = 0u;
         for (uint b = 0u; b < nb; b++) {
+            if (bit_pos < 0) {
+                atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
+                return;
+            }
             uint bpi = uint(bit_pos);
             bits = (bits << 1u) | ((uint(my_in[bpi >> 3u]) >> (bpi & 7u)) & 1u);
             bit_pos--;
@@ -321,6 +346,9 @@ kernel void tans_decode(
 
         chunk_out[tid + tg_size * uint(t)] = tok;
     }
+
+    if (state != ANS_L || bit_pos != -1)
+        atomic_store_explicit(&ans_err[gid], 1u, memory_order_relaxed);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -332,12 +360,17 @@ kernel void lz77_decode(
     device const LzToken*   tokens      [[ buffer(0) ]],
     device const uint32_t*  token_cnt   [[ buffer(1) ]],
     device       uint8_t*   out_data    [[ buffer(2) ]],
-    constant     uint32_t&  total_bytes [[ buffer(3) ]],
+    device       atomic_uint* lz_err    [[ buffer(3) ]],
+    constant     uint32_t&  total_bytes [[ buffer(4) ]],
 
     uint tid     [[ thread_index_in_threadgroup ]],
     uint tg_size [[ threads_per_threadgroup ]],
     uint gid     [[ threadgroup_position_in_grid ]]
 ) {
+    if (tid == 0u)
+        atomic_store_explicit(&lz_err[gid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     const uint base = gid * CHUNK_SIZE;
     if (base >= total_bytes) return;
     const uint clen = min(CHUNK_SIZE, total_bytes - base);
@@ -352,6 +385,10 @@ kernel void lz77_decode(
             for (uint i = 0u; i < n_tok && pos < clen; i++) {
                 if (ct[i].is_match) {
                     uint len = uint(ct[i].val), dist = uint(ct[i].dist);
+                    if (len == 0u || dist == 0u || dist > pos || pos + len > clen) {
+                        atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
+                        return;
+                    }
                     for (uint j = 0u; j < len && pos < clen; j++) {
                         out[pos] = out[pos - dist]; pos++;
                     }
@@ -359,6 +396,8 @@ kernel void lz77_decode(
                     out[pos++] = uint8_t(ct[i].val);
                 }
             }
+            if (pos != clen)
+                atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
         }
         return;
     }
@@ -389,6 +428,10 @@ kernel void lz77_decode(
             uint off  = pos;
             uint len  = uint(ct[i].val);
             uint dist = uint(ct[i].dist);
+            if (len == 0u || dist == 0u || dist > off || off + len > clen) {
+                atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
+                return;
+            }
 
             if (off - dist < max_mw) {
                 threadgroup_barrier(mem_flags::mem_device);
@@ -407,5 +450,7 @@ kernel void lz77_decode(
             max_mw = max(max_mw, off + len);
             pos += len;
         }
+        if (tid == 0u && pos != clen)
+            atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
     }
 }

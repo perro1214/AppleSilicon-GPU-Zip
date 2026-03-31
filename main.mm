@@ -611,7 +611,7 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
     // ダブルバッファ スロット
     id<MTLBuffer> slot_bs[N_BUFS], slot_bsz[N_BUFS], slot_tcnt[N_BUFS], slot_tok[N_BUFS];
-    id<MTLBuffer> slot_dec[N_BUFS];
+    id<MTLBuffer> slot_dec[N_BUFS], slot_anserr[N_BUFS], slot_lzerr[N_BUFS];
     for (uint32_t s = 0; s < N_BUFS; s++) {
         slot_bs[s]   = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * N_STREAMS * BS_CAP
                                         options:MTLResourceStorageModeShared];
@@ -623,6 +623,10 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                                          options:MTLResourceStorageModeShared];
         slot_dec[s]  = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * ANS_L * sizeof(DecodeEntry)
                                          options:MTLResourceStorageModeShared];
+        slot_anserr[s] = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * sizeof(uint32_t)
+                                           options:MTLResourceStorageModeShared];
+        slot_lzerr[s] = [dev newBufferWithLength:(size_t)BATCH_CHUNKS * sizeof(uint32_t)
+                                          options:MTLResourceStorageModeShared];
     }
 
     FILE* fout = fopen(out_path, "wb");
@@ -630,6 +634,7 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
     dispatch_semaphore_t buf_sem = dispatch_semaphore_create(N_BUFS);
     dispatch_group_t done_grp = dispatch_group_create();
+    __block bool decode_failed = false;
 
     uint32_t n_mega = (num_chunks + mb_chunks - 1) / mb_chunks;
     uint32_t total_batches = (num_chunks + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
@@ -648,6 +653,7 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
         uint32_t mb_n_batches = (mc_count + BATCH_CHUNKS - 1) / BATCH_CHUNKS;
 
         for (uint32_t b = 0; b < mb_n_batches; b++) {
+            if (decode_failed) break;
             dispatch_semaphore_wait(buf_sem, DISPATCH_TIME_FOREVER);
 
             uint32_t sl = b % N_BUFS;
@@ -658,8 +664,14 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
             uint8_t*  bs_data   = (uint8_t*)slot_bs[sl].contents;
             uint32_t* bsz_data  = (uint32_t*)slot_bsz[sl].contents;
             uint32_t* tcnt_data = (uint32_t*)slot_tcnt[sl].contents;
+            uint32_t* anserr_data = (uint32_t*)slot_anserr[sl].contents;
+            uint32_t* lzerr_data = (uint32_t*)slot_lzerr[sl].contents;
             DecodeEntry* dec_data = (DecodeEntry*)slot_dec[sl].contents;
             memset(bs_data, 0, (size_t)BATCH_CHUNKS * N_STREAMS * BS_CAP);
+            memset(bsz_data, 0, (size_t)BATCH_CHUNKS * N_STREAMS * sizeof(uint32_t));
+            memset(tcnt_data, 0, (size_t)BATCH_CHUNKS * sizeof(uint32_t));
+            memset(anserr_data, 0, (size_t)BATCH_CHUNKS * sizeof(uint32_t));
+            memset(lzerr_data, 0, (size_t)BATCH_CHUNKS * sizeof(uint32_t));
 
             for (uint32_t lc = 0; lc < lc_count; lc++) {
                 uint32_t gc = gc_start + lc;
@@ -700,6 +712,7 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                 [enc setBuffer:slot_dec[sl]  offset:0 atIndex:2];
                 [enc setBuffer:slot_tok[sl]  offset:0 atIndex:3];
                 [enc setBuffer:slot_tcnt[sl] offset:0 atIndex:4];
+                [enc setBuffer:slot_anserr[sl] offset:0 atIndex:5];
                 [enc dispatchThreadgroups:MTLSizeMake(lc_count, 1, 1)
                      threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
                 [enc endEncoding];
@@ -711,14 +724,42 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
                 [enc setBuffer:slot_tok[sl]  offset:0 atIndex:0];
                 [enc setBuffer:slot_tcnt[sl] offset:0 atIndex:1];
                 [enc setBuffer:buf_out       offset:(size_t)local_out_offset atIndex:2];
-                [enc setBytes:&batch_bytes   length:4 atIndex:3];
+                [enc setBuffer:slot_lzerr[sl] offset:0 atIndex:3];
+                [enc setBytes:&batch_bytes   length:4 atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(lc_count, 1, 1)
                      threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
                 [enc endEncoding];
             }
 
             dispatch_group_enter(done_grp);
-            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+            id<MTLBuffer> cap_anserr = slot_anserr[sl];
+            id<MTLBuffer> cap_lzerr = slot_lzerr[sl];
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull completed_cb) {
+                if (completed_cb.error) {
+                    fprintf(stderr, "[APLZ] Decode command buffer failed: %s\n",
+                            completed_cb.error.localizedDescription.UTF8String);
+                    dispatch_semaphore_signal(buf_sem);
+                    dispatch_group_leave(done_grp);
+                    return;
+                }
+                const uint32_t* ans_err = (const uint32_t*)cap_anserr.contents;
+                const uint32_t* lz_err = (const uint32_t*)cap_lzerr.contents;
+                for (uint32_t i = 0; i < lc_count; i++) {
+                    if (ans_err[i] != 0u) {
+                        fprintf(stderr, "[APLZ] Invalid ANS stream at chunk %u.\n", gc_start + i);
+                        decode_failed = true;
+                        dispatch_semaphore_signal(buf_sem);
+                        dispatch_group_leave(done_grp);
+                        return;
+                    }
+                    if (lz_err[i] != 0u) {
+                        fprintf(stderr, "[APLZ] Invalid LZ token stream at chunk %u.\n", gc_start + i);
+                        decode_failed = true;
+                        dispatch_semaphore_signal(buf_sem);
+                        dispatch_group_leave(done_grp);
+                        return;
+                    }
+                }
                 dispatch_semaphore_signal(buf_sem);
                 dispatch_group_leave(done_grp);
             }];
@@ -726,6 +767,12 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
         }
 
         dispatch_group_wait(done_grp, DISPATCH_TIME_FOREVER);
+        if (decode_failed) {
+            fclose(f);
+            fclose(fout);
+            unlink(out_path);
+            return EXIT_FAILURE;
+        }
 
         size_t mb_bytes = std::min(
             (size_t)mc_count * CHUNK_SIZE,
