@@ -22,6 +22,7 @@
 #include <string>
 #include <algorithm>
 #include <dispatch/dispatch.h>
+#include <limits>
 
 #include "APLZ.h"
 
@@ -65,13 +66,19 @@ static id<MTLLibrary> compile_shader(id<MTLDevice> dev, const char* path) {
 }
 
 // ─── Per-chunk ヒストグラム → SymInfo 正規化 ─────────────────────────────────
-static void compute_chunk_histogram(const LzToken* compact, uint32_t cnt,
-                                    uint32_t* freq) {
+static uint32_t compute_chunk_histogram(const LzToken* compact, uint32_t cnt,
+                                        uint32_t* freq) {
     memset(freq, 0, N_SYMBOLS * sizeof(uint32_t));
+    uint32_t matches = 0;
     for (uint32_t i = 0; i < cnt; ++i) {
-        if (compact[i].is_match) freq[256 + compact[i].val]++;
-        else                     freq[compact[i].val]++;
+        if (compact[i].is_match) {
+            freq[256 + compact[i].val]++;
+            matches++;
+        } else {
+            freq[compact[i].val]++;
+        }
     }
+    return matches;
 }
 
 static void normalize_histogram(const uint32_t* raw, SymInfo* si) {
@@ -377,9 +384,6 @@ static int compress(const char* in_path, const char* out_path, const char* shade
         // カウント収集
         for (uint32_t c = 0; c < mc_count; c++) {
             total_tokens += cnt_ptr[c];
-            const LzToken* base = compact_ptr + (uint64_t)c * CHUNK_SIZE;
-            for (uint32_t i = 0; i < cnt_ptr[c]; i++)
-                if (base[i].is_match) total_matches++;
         }
 
         // buf_cnt のローカルコピー
@@ -395,7 +399,8 @@ static int compress(const char* in_path, const char* out_path, const char* shade
 
         for (uint32_t c = 0; c < mc_count; c++) {
             SymInfo* si = &mb_sym_infos[c * N_SYMBOLS];
-            compute_chunk_histogram(compact_ptr + (uint64_t)c * CHUNK_SIZE, cnt_ptr[c], raw_freq);
+            total_matches += compute_chunk_histogram(
+                compact_ptr + (uint64_t)c * CHUNK_SIZE, cnt_ptr[c], raw_freq);
             normalize_histogram(raw_freq, si);
         }
 
@@ -466,16 +471,22 @@ static int compress(const char* in_path, const char* out_path, const char* shade
                         const SymInfo* si = &cap_sym[lc * N_SYMBOLS];
                         write_compact_freq(fout, si);
 
-                        // stream sizes + data
+                        // stream sizes + data (coalesced payload write)
                         uint16_t ssz[256];
-                        for (uint32_t s = 0; s < 256; s++)
+                        size_t payload_size = 0;
+                        for (uint32_t s = 0; s < 256; s++) {
                             ssz[s] = (uint16_t)bsz[(size_t)lc * 256 + s];
+                            payload_size += ssz[s];
+                        }
                         fwrite(ssz, 2, 256, fout);
 
+                        std::vector<uint8_t> payload;
+                        payload.reserve(payload_size);
                         for (uint32_t s = 0; s < 256; s++) {
                             const uint8_t* sdata = bs + ((size_t)lc * 256 + s) * BS_CAP;
-                            fwrite(sdata, 1, ssz[s], fout);
+                            payload.insert(payload.end(), sdata, sdata + ssz[s]);
                         }
+                        fwrite(payload.data(), 1, payload.size(), fout);
                     }
 
                     dispatch_semaphore_signal(buf_sem);
@@ -667,11 +678,10 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
             uint32_t* anserr_data = (uint32_t*)slot_anserr[sl].contents;
             uint32_t* lzerr_data = (uint32_t*)slot_lzerr[sl].contents;
             DecodeEntry* dec_data = (DecodeEntry*)slot_dec[sl].contents;
-            memset(bs_data, 0, (size_t)BATCH_CHUNKS * N_STREAMS * BS_CAP);
-            memset(bsz_data, 0, (size_t)BATCH_CHUNKS * N_STREAMS * sizeof(uint32_t));
-            memset(tcnt_data, 0, (size_t)BATCH_CHUNKS * sizeof(uint32_t));
-            memset(anserr_data, 0, (size_t)BATCH_CHUNKS * sizeof(uint32_t));
-            memset(lzerr_data, 0, (size_t)BATCH_CHUNKS * sizeof(uint32_t));
+            memset(bsz_data, 0, (size_t)lc_count * N_STREAMS * sizeof(uint32_t));
+            memset(tcnt_data, 0, (size_t)lc_count * sizeof(uint32_t));
+            memset(anserr_data, 0, (size_t)lc_count * sizeof(uint32_t));
+            memset(lzerr_data, 0, (size_t)lc_count * sizeof(uint32_t));
 
             for (uint32_t lc = 0; lc < lc_count; lc++) {
                 uint32_t gc = gc_start + lc;
@@ -691,9 +701,15 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
                 uint16_t ssz[256];
                 fread(ssz, 2, 256, f);
+                size_t stream_total = 0;
+                for (uint32_t s = 0; s < 256; s++) stream_total += ssz[s];
+                std::vector<uint8_t> stream_buf(stream_total);
+                fread(stream_buf.data(), 1, stream_total, f);
+                const uint8_t* src = stream_buf.data();
                 for (uint32_t s = 0; s < 256; s++) {
                     bsz_data[(size_t)lc * 256 + s] = (uint32_t)ssz[s];
-                    fread(bs_data + ((size_t)lc * 256 + s) * BS_CAP, 1, ssz[s], f);
+                    memcpy(bs_data + ((size_t)lc * 256 + s) * BS_CAP, src, ssz[s]);
+                    src += ssz[s];
                 }
             }
 

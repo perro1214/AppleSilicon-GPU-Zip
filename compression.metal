@@ -354,7 +354,7 @@ kernel void tans_decode(
 // ════════════════════════════════════════════════════════════════════════════════
 // Kernel 4: lz77_decode — LZ77 展開 (変更なし)
 // ════════════════════════════════════════════════════════════════════════════════
-constant uint MAX_PAR_TOKENS = 4096u;
+constant uint MAX_PAR_TOKENS = CHUNK_SIZE;
 
 kernel void lz77_decode(
     device const LzToken*   tokens      [[ buffer(0) ]],
