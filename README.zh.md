@@ -85,18 +85,27 @@ read .aplz header + chunk_offsets (seek table)
 
 | 偏移 | 大小 | 内容 |
 |---|---|---|
-| 0 | 24 B | `FileHeader` (magic "APLZ", version=3, original_size, chunk_size, num_chunks) |
+| 0 | 24 B | `FileHeader` (magic "APLZ", version=5, original_size, chunk_size, num_chunks) |
 | 24 | 4 B | `n_streams` = 256 |
 | 28 | 4 B | `ans_log_l` = 10 |
 | 32 | 8xN B | `chunk_offsets[N]` (seek table) |
-| ... | 可变 | Chunk data (per chunk: token_cnt + compact_freq + stream_sizes[256] + streams) |
+| ... | 可变 | Chunk data (N 个块，v5 编码) |
 
-Per-chunk 数据布局:
+Per-chunk 数据布局 (v5 编码):
+- `chunk_kind` (1 B): 0 = encoded (tANS), 1 = raw (回退)
 
+**编码块 (chunk_kind = 0) 的情况:**
+- `chunk_n_streams` (2 B): 此块的活跃 ANS 流数
 - `token_cnt` (4 B): dense token 数量
-- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` pairs (4 B each) — 仅非零符号
-- `stream_sizes[256]` (512 B): 每个 ANS 流的字节大小
-- stream data: 256 个连接的比特流
+- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` 对 (各 4 B) — 仅非零符号
+- `stream_sizes[chunk_n_streams]` (各 2 B): 每个 ANS 流的字节大小
+- stream data: ANS 比特流 (采用 v5 **紧凑距离编码**)
+  - 短距离 (≤255): 8-bit payload + 1-bit flag
+  - 长距离 (>255): 16-bit payload + 1-bit flag
+
+**原始块 (chunk_kind = 1) 的情况:**
+- `raw_size` (4 B): 未压缩块大小
+- raw bytes: 原始数据 (当编码输出超过输入时的回退)
 
 ## 安装
 

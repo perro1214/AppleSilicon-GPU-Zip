@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <vector>
+#include <string>
 #include <algorithm>
 #include <dispatch/dispatch.h>
 
@@ -237,7 +238,23 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     if (fstat(fd, &st) < 0) die("fstat");
     const size_t file_size = (size_t)st.st_size;
     if (file_size == 0) {
-        fprintf(stderr, "[APLZ] Empty input.\n"); close(fd); return EXIT_FAILURE;
+        close(fd);
+        // 空ファイル: ヘッダのみ書き出して正常終了
+        FILE* fout = fopen(out_path, "wb");
+        if (!fout) { perror("fopen"); return EXIT_FAILURE; }
+        FileHeader hdr;
+        memcpy(hdr.magic, "APLZ", 4);
+        hdr.version       = APLZ_MAGIC_V3;
+        hdr.original_size = 0;
+        hdr.chunk_size    = CHUNK_SIZE;
+        hdr.num_chunks    = 0;
+        fwrite(&hdr, sizeof(hdr), 1, fout);
+        uint32_t ns_val = N_STREAMS, al_val = ANS_LOG_L;
+        fwrite(&ns_val, 4, 1, fout);
+        fwrite(&al_val, 4, 1, fout);
+        fclose(fout);
+        printf("[APLZ] Empty file → %s (header only)\n", out_path);
+        return EXIT_SUCCESS;
     }
 
     void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -310,8 +327,9 @@ static int compress(const char* in_path, const char* out_path, const char* shade
 
     CFTimeInterval t_total_start = CACurrentMediaTime();
 
-    // ── ファイルヘッダ ──────────────────────────────────────────────────────
-    FILE* fout = fopen(out_path, "wb");
+    // ── ファイルヘッダ (一時ファイルに書き込み、完了後にrename) ─────────────
+    std::string tmp_path = std::string(out_path) + ".tmp";
+    FILE* fout = fopen(tmp_path.c_str(), "wb");
     if (!fout) { perror("fopen"); return EXIT_FAILURE; }
 
     FileHeader hdr;
@@ -487,6 +505,13 @@ static int compress(const char* in_path, const char* out_path, const char* shade
     uint64_t comp_size = (uint64_t)ftell(fout);
     fclose(fout);
 
+    // 一時ファイルを最終パスにアトミック移動
+    if (rename(tmp_path.c_str(), out_path) != 0) {
+        perror("rename");
+        unlink(tmp_path.c_str());
+        return EXIT_FAILURE;
+    }
+
     // sparse バッファ解放
     buf_sparse = nil;
 
@@ -532,6 +557,16 @@ static int decompress(const char* in_path, const char* out_path, const char* sha
 
     const uint32_t num_chunks = hdr.num_chunks;
     const uint64_t original_size = hdr.original_size;
+
+    // 空ファイル: 0バイトの出力ファイルを作成して正常終了
+    if (num_chunks == 0 && original_size == 0) {
+        fclose(f);
+        FILE* fout = fopen(out_path, "wb");
+        if (!fout) { perror("fopen"); return EXIT_FAILURE; }
+        fclose(fout);
+        printf("[APLZ] Empty archive → %s (0 bytes)\n", out_path);
+        return EXIT_SUCCESS;
+    }
 
     std::vector<uint64_t> chunk_offsets(num_chunks);
     fread(chunk_offsets.data(), 8, num_chunks, f);

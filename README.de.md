@@ -85,18 +85,27 @@ read .aplz header + chunk_offsets (seek table)
 
 | Offset | Groesse | Inhalt |
 |---|---|---|
-| 0 | 24 B | `FileHeader` (magic "APLZ", version=3, original_size, chunk_size, num_chunks) |
+| 0 | 24 B | `FileHeader` (magic "APLZ", version=5, original_size, chunk_size, num_chunks) |
 | 24 | 4 B | `n_streams` = 256 |
 | 28 | 4 B | `ans_log_l` = 10 |
 | 32 | 8xN B | `chunk_offsets[N]` (seek table) |
-| ... | variabel | Chunk data (per chunk: token_cnt + compact_freq + stream_sizes[256] + streams) |
+| ... | variabel | Chunk data (N Chunks, v5-Kodierung) |
 
-Per-chunk Datenstruktur:
+Per-chunk Datenstruktur (v5-Kodierung):
+- `chunk_kind` (1 B): 0 = encoded (tANS), 1 = raw (Fallback)
 
+**Kodierter Chunk (chunk_kind = 0):**
+- `chunk_n_streams` (2 B): Anzahl der aktiven ANS-Streams fuer diesen Chunk
 - `token_cnt` (4 B): Anzahl der dichten Tokens
 - `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` Paare (je 4 B) — nur Nicht-Null-Symbole
-- `stream_sizes[256]` (512 B): Bytegroesse jedes ANS-Streams
-- stream data: 256 verkettete Bitstreams
+- `stream_sizes[chunk_n_streams]` (je 2 B): Bytegroesse jedes ANS-Streams
+- stream data: verkettete ANS-Bitstreams mit **v5 kompakter Distanzkodierung**
+  - Kurze Distanz (≤255): 8-Bit-Payload + 1-Bit-Flag
+  - Lange Distanz (>255): 16-Bit-Payload + 1-Bit-Flag
+
+**Rohes Chunk (chunk_kind = 1):**
+- `raw_size` (4 B): Groesse des unkomprimierten Chunks
+- raw bytes: Originaldaten (Fallback wenn kodierte Ausgabe Eingabe uebersteigt)
 
 ## Installation
 

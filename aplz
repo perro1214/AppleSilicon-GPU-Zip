@@ -66,6 +66,27 @@ human_size() {
     fi
 }
 
+tar_is_safe() {
+    local tar_path="$1"
+    local tar_entries
+    local entry
+
+    if ! tar_entries="$(tar -tf "$tar_path")"; then
+        echo "Error: Failed to inspect tar archive." >&2
+        return 1
+    fi
+
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        if [[ "$entry" == /* || "$entry" =~ (^|/)\.\.(/|$) ]]; then
+            echo "Error: Unsafe tar entry detected: ${entry}" >&2
+            return 1
+        fi
+    done <<< "$tar_entries"
+
+    return 0
+}
+
 # ─── compress サブコマンド ───────────────────────────────────────────────────
 do_compress() {
     local input="$1"
@@ -83,7 +104,7 @@ do_compress() {
         [[ -z "$output" ]] && output="$(dirname "${input%/}")/${dir_name}.tar.aplz"
 
         echo "==> Archiving directory: ${input} → tar"
-        TMP_TAR="$(mktemp /tmp/aplz_XXXXXX.tar)"
+        TMP_TAR="$(mktemp /tmp/aplz_XXXXXX).tar"
         tar cf "$TMP_TAR" -C "$(dirname "${input%/}")" "$dir_name"
 
         local tar_size
@@ -134,12 +155,20 @@ do_extract() {
 
     if $is_tar_aplz; then
         # .tar.aplz → decompress → tar extract
-        TMP_TAR="$(mktemp /tmp/aplz_XXXXXX.tar)"
+        TMP_TAR="$(mktemp /tmp/aplz_XXXXXX).tar"
 
         echo "==> Decompressing: ${input} → tar"
         "$GPU_ZIP" -d "$input" "$TMP_TAR" "$SHADER"
 
         [[ -z "$output_dir" ]] && output_dir="."
+        if [[ -e "$output_dir" && ! -d "$output_dir" ]]; then
+            echo "Error: '${output_dir}' exists and is not a directory." >&2
+            exit 1
+        fi
+        if ! tar_is_safe "$TMP_TAR"; then
+            exit 1
+        fi
+        mkdir -p "$output_dir"
         echo "==> Extracting tar → ${output_dir}/"
         tar xf "$TMP_TAR" -C "$output_dir"
         rm -f "$TMP_TAR"
@@ -151,7 +180,15 @@ do_extract() {
         # .aplz → decompress
         local base_name
         base_name="$(basename "$input" .aplz)"
-        local out_file="${output_dir:-$base_name}"
+        local out_file="$base_name"
+
+        if [[ -n "$output_dir" ]]; then
+            if [[ -d "$output_dir" ]]; then
+                out_file="${output_dir}/${base_name}"
+            else
+                out_file="$output_dir"
+            fi
+        fi
 
         echo "==> Decompressing: ${input} → ${out_file}"
         "$GPU_ZIP" -d "$input" "$out_file" "$SHADER"
@@ -173,6 +210,11 @@ do_info() {
 
     local file_size
     file_size=$(stat -f%z "$input" 2>/dev/null || stat -c%s "$input" 2>/dev/null)
+
+    if [[ $file_size -lt 24 ]]; then
+        echo "Error: File too small to be a valid APLZ file (requires at least 24 bytes)." >&2
+        exit 1
+    fi
 
     # FileHeader の先頭 24 バイトを読み取り
     local magic version orig_size chunk_size num_chunks

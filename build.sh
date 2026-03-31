@@ -66,6 +66,6 @@ echo "     \"import sys; sys.stdout.buffer.write((b'hello world ' * 100000)[:10*
 echo "     > test_text.bin"
 echo ""
 echo "   # Run"
-echo "   ./${TARGET} test_random.bin out.bin ${SHADER}"
-echo "   ./${TARGET} test_text.bin  out.bin ${SHADER}"
+echo "   ./${TARGET} -c test_random.bin out.bin ${SHADER}"
+echo "   ./${TARGET} -c test_text.bin  out.bin ${SHADER}"
 echo "============================================================"

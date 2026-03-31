@@ -328,9 +328,7 @@ for f in "$@"; do
     if [ -d "$f" ]; then
         # ディレクトリ: /tmp にコピー (Google Drive対応: -c でクローンせずバイトコピー)
         mkdir -p "$tmp"
-        for item in "$f"/*; do
-            [ -e "$item" ] && cp "$(readlink -f "$item" 2>/dev/null || echo "$item")" "$tmp/" 2>/dev/null || true
-        done
+        cp -R "$f"/. "$tmp" 2>/dev/null || true
         '"${APLZ_PATH}"' compress "$tmp" "${dir}/${base}.tar.aplz"
         rc=$?
         rm -rf "$tmp"

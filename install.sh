@@ -112,10 +112,12 @@ do_install() {
 do_install "${SCRIPT_DIR}/gpu_zip" "${BIN_DIR}/gpu_zip" 755
 do_install "$WRAPPER"              "${BIN_DIR}/aplz"    755
 do_install "$SHADER"               "${BIN_DIR}/compression.metal" 644
+do_install "${SCRIPT_DIR}/compression.metallib" "${BIN_DIR}/compression.metallib" 644
 
-echo "    gpu_zip           -> ${BIN_DIR}/gpu_zip"
-echo "    aplz              -> ${BIN_DIR}/aplz"
-echo "    compression.metal -> ${BIN_DIR}/compression.metal"
+echo "    gpu_zip              -> ${BIN_DIR}/gpu_zip"
+echo "    aplz                 -> ${BIN_DIR}/aplz"
+echo "    compression.metal    -> ${BIN_DIR}/compression.metal"
+echo "    compression.metallib -> ${BIN_DIR}/compression.metallib"
 
 # ─── PATH チェック ───────────────────────────────────────────────────────────
 echo ""

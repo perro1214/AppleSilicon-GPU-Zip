@@ -85,18 +85,27 @@ read .aplz header + chunk_offsets (seek table)
 
 | Offset | Tamaño | Contenido |
 |---|---|---|
-| 0 | 24 B | `FileHeader` (magic "APLZ", version=3, original_size, chunk_size, num_chunks) |
+| 0 | 24 B | `FileHeader` (magic "APLZ", version=5, original_size, chunk_size, num_chunks) |
 | 24 | 4 B | `n_streams` = 256 |
 | 28 | 4 B | `ans_log_l` = 10 |
 | 32 | 8xN B | `chunk_offsets[N]` (seek table) |
-| ... | variable | Chunk data (per chunk: token_cnt + compact_freq + stream_sizes[256] + streams) |
+| ... | variable | Chunk data (N bloques, codificación v5) |
 
-Estructura de datos por bloque:
+Estructura de datos por bloque (codificación v5):
+- `chunk_kind` (1 B): 0 = encoded (tANS), 1 = raw (fallback)
 
+**Bloque codificado (chunk_kind = 0):**
+- `chunk_n_streams` (2 B): número de flujos ANS activos para este bloque
 - `token_cnt` (4 B): número de tokens densos
-- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` pairs (4 B each) — solo símbolos no nulos
-- `stream_sizes[256]` (512 B): tamaño en bytes de cada flujo ANS
-- stream data: 256 flujos de bits concatenados
+- `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` pares (4 B cada) — solo símbolos no nulos
+- `stream_sizes[chunk_n_streams]` (2 B cada): tamaño en bytes de cada flujo ANS
+- stream data: flujos de bits ANS concatenados con **codificación de distancia compacta v5**
+  - Distancia corta (≤255): payload de 8 bits + 1-bit flag
+  - Distancia larga (>255): payload de 16 bits + 1-bit flag
+
+**Bloque sin comprimir (chunk_kind = 1):**
+- `raw_size` (4 B): tamaño de bloque sin comprimir
+- raw bytes: datos originales (fallback cuando la salida codificada excede la entrada)
 
 ## Instalación
 

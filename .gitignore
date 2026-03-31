@@ -26,3 +26,7 @@ build/
 *~
 .vscode/
 .idea/
+
+# Local notes
+/blog.md
+/Users/hayato/project/GPU_ZIP/blog.md

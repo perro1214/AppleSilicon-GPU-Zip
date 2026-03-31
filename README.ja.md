@@ -85,18 +85,27 @@ read .aplz header + chunk_offsets (seek table)
 
 | Offset | Size | Content |
 |---|---|---|
-| 0 | 24 B | `FileHeader` (magic "APLZ", version=3, original_size, chunk_size, num_chunks) |
+| 0 | 24 B | `FileHeader` (magic "APLZ", version=5, original_size, chunk_size, num_chunks) |
 | 24 | 4 B | `n_streams` = 256 |
 | 28 | 4 B | `ans_log_l` = 10 |
 | 32 | 8xN B | `chunk_offsets[N]` (seek table) |
-| ... | variable | Chunk data (per chunk: token_cnt + compact_freq + stream_sizes[256] + streams) |
+| ... | variable | Chunk data (N チャンク、v5 形式) |
 
-Per-chunk データ構造:
+Per-chunk データ構造 (v5 形式):
+- `chunk_kind` (1 B): 0 = encoded (tANS), 1 = raw (フォールバック)
 
+**encoded (chunk_kind = 0) の場合:**
+- `chunk_n_streams` (2 B): このチャンクのアクティブな ANS ストリーム数
 - `token_cnt` (4 B): dense token 数
 - `compact_freq`: `n_nonzero` (2 B) + `[sym_id, freq]` pairs (4 B each) — 非ゼロシンボルのみ
-- `stream_sizes[256]` (512 B): 各 ANS ストリームのバイトサイズ
-- stream data: 256 本の連結ビットストリーム
+- `stream_sizes[chunk_n_streams]` (2 B each): 各 ANS ストリームのバイトサイズ
+- stream data: ANS ビットストリーム (v5 **compact distance coding** 使用)
+  - 短距離 (≤255): 8-bit payload + 1-bit flag
+  - 長距離 (>255): 16-bit payload + 1-bit flag
+
+**raw (chunk_kind = 1) の場合:**
+- `raw_size` (4 B): 非圧縮チャンクサイズ
+- raw bytes: 元データ (エンコード出力が入力を超える場合のフォールバック)
 
 ## インストール
 
