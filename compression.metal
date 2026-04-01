@@ -4,7 +4,7 @@
 //   compress_chunk  — LZ77 マッチング + greedy overlap resolution
 //   tans_encode     — 256 インターリーブ ANS ストリーム並列エンコード (per-chunk table)
 //   tans_decode     — 256 インターリーブ ANS ストリーム並列デコード (per-chunk table)
-//   lz77_decode     — LZ77 展開 (ハイブリッド並列/シリアル)
+//   lz77_decode     — LZ77 展開 (完全並列化: モジュロコピー)
 
 #include <metal_stdlib>
 using namespace metal;
@@ -15,7 +15,6 @@ constant uint HASH_BITS  = 11u;
 constant uint HASH_SIZE  = 1u << HASH_BITS;
 constant uint MAX_MATCH  = 255u;
 constant uint MIN_MATCH  = 3u;
-constant uint SERIAL_FALLBACK_TOKEN_THRESHOLD = 8192u;
 
 // ─── tANS 定数 ─────────────────────────────────────────────────────────────────
 constant uint ANS_LOG_L  = 10u;
@@ -81,6 +80,13 @@ kernel void compress_chunk(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint i = tid; i + 2u < clen; i += tg_size) {
+        // Run-Skipping: 同一文字が3バイト以上連続するランの途中はハッシュ更新をスキップ。
+        // ランの先頭のみ更新することで、同一アドレスへの atomic 集中を回避。
+        if (i > 0u &&
+            in_data[base+i]   == in_data[base+i-1u] &&
+            in_data[base+i+1u] == in_data[base+i-1u] &&
+            in_data[base+i+2u] == in_data[base+i-1u])
+            continue;
         uint slot  = h3(in_data[base+i], in_data[base+i+1], in_data[base+i+2]);
         uint old_a = atomic_fetch_min_explicit(&ht_a[slot], i, memory_order_relaxed);
         if (old_a != 0xFFFFFFFFu && old_a > i)
@@ -119,21 +125,13 @@ kernel void compress_chunk(
     }
     threadgroup_barrier(mem_flags::mem_device);
 
-    // ── コンパクション並列化 (parallel prefix-sum) ─────────────────────────
-    // アルゴリズム:
-    //   Step 1 (tid==0): sparse を1回走査し、各スレッドの担当開始位置 tg_starts[t] を決定。
-    //                    担当区間は compact トークン数が均等になるよう割り当てる。
-    //   Step 2 (全スレッド): 各スレッドが [tg_starts[tid], tg_starts[tid+1]) を走査し、
-    //                         compact トークンを sparse バッファの専用スロットに書く。
-    //                         (sparse はこの時点で読み終わっており安全に再利用可能)
-    //   Step 3 (tid==0): exclusive prefix-sum で書き込みオフセットを計算。
-    //   Step 4 (全スレッド): sparse 一時領域 -> compact 最終バッファへコピー。
-    //                         sparse と compact は別バッファなので競合なし。
+    // ── コンパクション並列化 ──────────────────────────────────────────────
+    // Step 1 (tid==0): sparse を走査し、各スレッドの担当開始位置と書き込みオフセットを計算。
+    // Step 2 (全スレッド): sparse → compact に直接書き込み (Step 3/4 不要)。
     threadgroup uint tg_starts[256];    // 各 tid の sparse 走査開始インデックス
-    threadgroup uint tg_local_cnt[256]; // 各 tid が生成するトークン数
-    threadgroup uint tg_offsets[257];   // exclusive prefix-sum (size tg_size+1)
+    threadgroup uint tg_offsets[257];   // 各 tid の compact 書き込みオフセット (exclusive prefix-sum)
 
-    // Step 1
+    // Step 1: tid==0 が sparse を走査して担当区間とオフセットを計算
     if (tid == 0u) {
         uint total_tok = 0u;
         uint i = 0u;
@@ -146,6 +144,7 @@ kernel void compress_chunk(
         uint tok_count = 0u;
         uint cur_tid = 0u;
         tg_starts[0u] = 0u;
+        tg_offsets[0u] = 0u;
         i = 0u;
         while (i < clen) {
             tok_count++;
@@ -154,54 +153,27 @@ kernel void compress_chunk(
             if (tok_count % toks_per == 0u && cur_tid + 1u < tg_size) {
                 cur_tid++;
                 tg_starts[cur_tid] = i;
+                tg_offsets[cur_tid] = tok_count;
             }
         }
-        for (uint t = cur_tid + 1u; t < tg_size; t++)
+        for (uint t = cur_tid + 1u; t < tg_size; t++) {
             tg_starts[t] = clen;
+            tg_offsets[t] = total_tok;
+        }
+        tg_offsets[tg_size] = total_tok;
         compact_cnt[gid] = total_tok;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 2: 担当区間をコンパクション。
-    // 一時書き込み先: compact[tid * max_per_thread + k]。
-    // sparse と compact は別バッファなので sparse の読み取りに干渉しない。
-    // tg_offsets[tid] <= tid * max_per_thread が常に成立するため、
-    // Step 4 の前方コピーでスレッド間のデータ競合も起きない（後述）。
-    uint my_start = tg_starts[tid];
-    uint my_end   = (tid + 1u < tg_size) ? tg_starts[tid + 1u] : clen;
-    const uint max_per_thread = (CHUNK_SIZE + tg_size - 1u) / tg_size;
-    device LzToken* my_tmp = compact + tid * max_per_thread;
-
-    uint local_cnt = 0u;
+    // Step 2: 各スレッドが sparse → compact に直接書き込み。
+    // 各スレッドの書き込み先 compact[tg_offsets[tid] + k] は互いに重ならないため安全。
     {
-        uint i = my_start;
-        while (i < my_end && local_cnt < max_per_thread) {
-            LzToken tok = sparse[i];
-            my_tmp[local_cnt++] = tok;
-            i += tok.is_match ? uint(tok.val) : 1u;
-        }
-    }
-    tg_local_cnt[tid] = local_cnt;
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // Step 3: exclusive prefix-sum
-    if (tid == 0u) {
-        tg_offsets[0u] = 0u;
-        for (uint t = 0u; t < tg_size; t++)
-            tg_offsets[t + 1u] = tg_offsets[t] + tg_local_cnt[t];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Step 4: tid==0 が compact 一時領域を前から順に最終位置へ詰める。
-    // 複数スレッドが同バッファを同時に読み書きすると競合するため tid==0 でシリアル実施。
-    if (tid == 0u) {
-        uint total_tok = tg_offsets[tg_size];
-        uint dst = 0u;
-        for (uint t = 0u; t < tg_size && dst < total_tok; t++) {
-            uint src = t * max_per_thread;
-            uint cnt = tg_local_cnt[t];
-            for (uint k = 0u; k < cnt; k++)
-                compact[dst++] = compact[src + k];
+        uint i = tg_starts[tid];
+        uint my_end = (tid + 1u < tg_size) ? tg_starts[tid + 1u] : clen;
+        uint dst = tg_offsets[tid];
+        while (i < my_end) {
+            compact[dst++] = sparse[i];
+            i += sparse[i].is_match ? uint(sparse[i].val) : 1u;
         }
     }
 }
@@ -423,7 +395,15 @@ kernel void tans_decode(
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
-// Kernel 4: lz77_decode — LZ77 展開 (変更なし)
+// Kernel 4: lz77_decode — LZ77 展開 (完全並列化)
+//
+// 並列化手法:
+//   Phase A (tid==0): バリデーション + リテラル書き込み (出力オフセット計算)
+//   Phase B (全スレッド): マッチ並列コピー (モジュロ演算で重複マッチ対応)
+//
+// 旧コードのボトルネックを排除:
+//   - tg_serial_mode の直列フォールバックを完全削除
+//   - 重複マッチ (dist < len) の tid==0 シリアルコピーをモジュロ並列コピーに置換
 // ════════════════════════════════════════════════════════════════════════════════
 kernel void lz77_decode(
     device const LzToken*   tokens      [[ buffer(0) ]],
@@ -448,16 +428,14 @@ kernel void lz77_decode(
     device const LzToken* ct = tokens + (uint64_t)gid * CHUNK_SIZE;
     device uint8_t* out = out_data + base;
 
-    threadgroup uint tg_serial_mode;
+    // ── Phase A (tid==0): バリデーション + リテラル即時書き込み ──────────
     threadgroup uint tg_invalid;
-
-    tg_serial_mode = 0u;
-    tg_invalid = 0u;
+    if (tid == 0u)
+        tg_invalid = 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0u) {
         uint pos = 0u;
-        uint match_cnt = 0u;
         for (uint i = 0u; i < n_tok && pos < clen; i++) {
             if (ct[i].is_match) {
                 uint len = uint(ct[i].val), dist = uint(ct[i].dist);
@@ -465,49 +443,26 @@ kernel void lz77_decode(
                     tg_invalid = 1u;
                     break;
                 }
-                match_cnt++;
                 pos += len;
             } else {
+                out[pos] = uint8_t(ct[i].val);
                 pos += 1u;
             }
         }
         if (tg_invalid == 0u && pos != clen)
             tg_invalid = 1u;
-        if (tg_invalid != 0u) {
+        if (tg_invalid != 0u)
             atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
-        } else if (n_tok > SERIAL_FALLBACK_TOKEN_THRESHOLD &&
-                   match_cnt * 16u <= n_tok) {
-            tg_serial_mode = 1u;
-            pos = 0u;
-            for (uint i = 0u; i < n_tok && pos < clen; i++) {
-                if (ct[i].is_match) {
-                    uint len = uint(ct[i].val), dist = uint(ct[i].dist);
-                    for (uint j = 0u; j < len && pos < clen; j++) {
-                        out[pos] = out[pos - dist];
-                        pos++;
-                    }
-                } else {
-                    out[pos++] = uint8_t(ct[i].val);
-                }
-            }
-            if (pos != clen) {
-                tg_invalid = 1u;
-                atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
-            }
-        } else {
-            pos = 0u;
-            for (uint i = 0u; i < n_tok; i++) {
-                if (!ct[i].is_match)
-                    out[pos] = uint8_t(ct[i].val);
-                pos += ct[i].is_match ? uint(ct[i].val) : 1u;
-            }
-        }
     }
-    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
-    if (tg_invalid != 0u || tg_serial_mode != 0u)
+    if (tg_invalid != 0u)
         return;
 
+    // ── Phase B (全スレッド): マッチ並列コピー ──────────────────────────
+    // 全トークンを順次走査し、マッチごとに全スレッドで並列コピー。
+    // 重複マッチ (dist < len) はモジュロ演算: out[off+j] = out[off-dist + (j%dist)]
+    // これにより自己参照チェーンを O(1) インデックス計算に還元。
     {
         uint pos = 0u;
         uint max_mw = 0u;
@@ -520,31 +475,18 @@ kernel void lz77_decode(
             uint off  = pos;
             uint len  = uint(ct[i].val);
             uint dist = uint(ct[i].dist);
-            if (len == 0u || dist == 0u || dist > off || off + len > clen) {
-                atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
-                return;
-            }
 
+            // 前のマッチの書き込み範囲とソースが重なる場合は同期
             if (off - dist < max_mw) {
                 threadgroup_barrier(mem_flags::mem_device);
             }
 
-            if (dist >= len) {
-                for (uint j = tid; j < len; j += tg_size)
-                    out[off + j] = out[off - dist + j];
-            } else {
-                if (tid == 0u) {
-                    for (uint j = 0u; j < len; j++)
-                        out[off + j] = out[off - dist + j];
-                }
-            }
+            // モジュロ演算で重複・非重複マッチを統一的に並列コピー
+            for (uint j = tid; j < len; j += tg_size)
+                out[off + j] = out[off - dist + (j % dist)];
 
             max_mw = max(max_mw, off + len);
             pos += len;
-        }
-        if (tid == 0u) {
-            if (pos != clen)
-                atomic_store_explicit(&lz_err[gid], 1u, memory_order_relaxed);
         }
     }
 }
