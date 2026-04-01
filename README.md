@@ -173,17 +173,15 @@ aplz info myfile.txt.aplz
 
 | Data | Input | Output | Ratio | Throughput |
 |---|---|---|---|---|
-| Text (repeating pattern) | 1 MB | 31 KB | 3.0% | 50 MB/s |
-| Text (large) | 100 MB | 3.0 MB | 3.0% | 251 MB/s |
-| Random binary | 10 MB | 10.6 MB | 106% | 121 MB/s |
+| Text (repeating pattern) | 512 MB | 15.2 MB | 3.0% | 373 MB/s |
+| Random binary | 512 MB | 567 MB | 106% | 113 MB/s |
 
 ### Decompression
 
-| Data | Speed | Notes |
-|---|---|---|
-| Text (1 MB) | 246 MB/s | 1 mega-batch, minimal pipeline overhead |
-| Text (100 MB) | 1.4 GB/s | 4 mega-batches, full pipeline overlap |
-| Random (10 MB) | 246 MB/s | 1 mega-batch, mostly literals |
+| Data | Input | Speed | Notes |
+|---|---|---|---|
+| Text (repeating pattern) | 512 MB | 2.8 GB/s | 16 mega-batches, full pipeline overlap |
+| Random binary | 512 MB | 145 MB/s | 16 mega-batches, mostly literals |
 
 > Random data is incompressible so output slightly exceeds input (tANS/distance field overhead).
 > Memory usage is constant (~512 MB) regardless of input size thanks to mega-batch streaming.
